@@ -1,4 +1,5 @@
-﻿import json
+import json
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -7,11 +8,11 @@ from sqlalchemy.pool import StaticPool
 from app.db.session import Base
 from app.models import (
     Employee,
-    PerformanceRecord,
+    EvaluationTheme,
     Goal,
+    PerformanceRecord,
     Skill,
     TaskOutcome,
-    EvaluationTheme,
 )
 from app.services.career_coach_context import CareerCoachContextBuilder
 
@@ -259,3 +260,77 @@ def test_non_existent_employee(db):
     assert result["has_sufficient_data"] is False
     assert result["context"] is None
     assert "not found" in result["error"]
+
+# 7. P0-4: Unapproved records are excluded from context
+def test_unapproved_records_excluded(db, seed_data):
+    _emp_a, _ = seed_data
+    # Add an unapproved goal and unapproved task
+    unapproved_goal = Goal(
+        employee_id="EMP-A",
+        title="Unapproved Secret Project",
+        progress=10.0,
+        is_approved=False,
+        period="2026-Q3"
+    )
+    unapproved_task = TaskOutcome(
+        employee_id="EMP-A",
+        title="Unapproved Draft Task",
+        status="in_progress",
+        outcome="Draft results",
+        is_approved=False,
+        period="2026-Q3"
+    )
+    db.add_all([unapproved_goal, unapproved_task])
+    db.commit()
+
+    result = CareerCoachContextBuilder.build_context(db, employee_id="EMP-A", period="2026-Q3")
+    context = result["context"]
+    approved_sources = result["approved_sources"]
+
+    # Verify unapproved records are NOT in context
+    goal_titles = [g["title"] for g in context["goals"]]
+    assert "Unapproved Secret Project" not in goal_titles
+
+    task_titles = [t["title"] for t in context["task_outcomes"]]
+    assert "Unapproved Draft Task" not in task_titles
+
+    # Verify unapproved IDs are NOT in approved_sources
+    assert ("goal", unapproved_goal.id) not in approved_sources
+    assert ("task_outcome", unapproved_task.id) not in approved_sources
+
+# 8. P1-2: Context budget limits and source tracking
+def test_context_budget_limits_and_tracking(db):
+    emp = Employee(
+        id="EMP-LARGE",
+        first_name="Leo",
+        last_name="Large",
+        role_title="Senior Architect",
+        department="Engineering"
+    )
+    db.add(emp)
+    db.commit()
+
+    # Add 15 goals (limit is MAX_GOALS = 8)
+    for i in range(15):
+        db.add(Goal(
+            employee_id="EMP-LARGE",
+            title=f"Goal {i} with long description " + "x" * 400,
+            progress=50.0,
+            is_approved=True,
+            period="2026-Q3"
+        ))
+    # Add single records for other categories to fulfill sufficiency
+    db.add(PerformanceRecord(employee_id="EMP-LARGE", period="2026-Q3", overall_score=90.0, task_completion_rate=90.0, goal_achievement_rate=90.0, attendance_rate=99.0))
+    db.add(Skill(employee_id="EMP-LARGE", name="Architecture", level="Expert", evidence="Evidence"))
+    db.add(TaskOutcome(employee_id="EMP-LARGE", title="Task 1", status="completed", outcome="Outcome", period="2026-Q3"))
+    db.add(EvaluationTheme(employee_id="EMP-LARGE", theme="Design", sentiment="positive", evidence="Theme evidence", period="2026-Q3"))
+    db.commit()
+
+    result = CareerCoachContextBuilder.build_context(db, employee_id="EMP-LARGE", period="2026-Q3")
+    assert result["has_sufficient_data"] is True
+    # Goals should be capped to 8
+    assert len(result["context"]["goals"]) == 8
+    # Tracked source IDs should have exactly 8 goals
+    assert len(result["selected_source_ids"]["goal"]) == 8
+    # Long text should be truncated
+    assert len(result["context"]["goals"][0]["title"]) <= 303

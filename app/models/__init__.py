@@ -1,10 +1,23 @@
-﻿from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, Float, Text, DateTime, ForeignKey
+from datetime import datetime, timezone
+
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+)
 from sqlalchemy.orm import relationship
+
 from app.db.session import Base
+
 
 def utc_now():
     return datetime.now(timezone.utc)
+
 
 class Employee(Base):
     __tablename__ = "employees"
@@ -34,6 +47,7 @@ class PerformanceRecord(Base):
     task_completion_rate = Column(Float, nullable=False)     # percentage e.g., 92.5
     goal_achievement_rate = Column(Float, nullable=False)    # percentage e.g., 88.0
     attendance_rate = Column(Float, nullable=False)          # percentage e.g., 99.0
+    is_approved = Column(Boolean, default=True, server_default="1", nullable=False)
     created_at = Column(DateTime, default=utc_now, nullable=False)
 
     employee = relationship("Employee", back_populates="performance_records")
@@ -49,6 +63,7 @@ class Goal(Base):
     status = Column(String(50), default="in_progress", nullable=False)  # "in_progress", "completed", "delayed"
     deadline = Column(String(50), nullable=True)
     period = Column(String(20), nullable=True)               # e.g., "2026-Q3"
+    is_approved = Column(Boolean, default=True, server_default="1", nullable=False)
     created_at = Column(DateTime, default=utc_now, nullable=False)
 
     employee = relationship("Employee", back_populates="goals")
@@ -62,6 +77,7 @@ class Skill(Base):
     name = Column(String(100), nullable=False)
     level = Column(String(50), nullable=False)               # "Beginner", "Intermediate", "Advanced", "Expert"
     evidence = Column(Text, nullable=True)
+    is_approved = Column(Boolean, default=True, server_default="1", nullable=False)
     created_at = Column(DateTime, default=utc_now, nullable=False)
 
     employee = relationship("Employee", back_populates="skills")
@@ -77,6 +93,7 @@ class TaskOutcome(Base):
     outcome = Column(Text, nullable=True)
     completion_date = Column(String(50), nullable=True)
     period = Column(String(20), nullable=True)               # e.g., "2026-Q3"
+    is_approved = Column(Boolean, default=True, server_default="1", nullable=False)
     created_at = Column(DateTime, default=utc_now, nullable=False)
 
     employee = relationship("Employee", back_populates="task_outcomes")
@@ -91,6 +108,23 @@ class EvaluationTheme(Base):
     sentiment = Column(String(50), nullable=False)           # "positive", "neutral", "needs_improvement"
     evidence = Column(Text, nullable=False)
     period = Column(String(20), nullable=True)               # e.g., "2026-Q3"
+    is_approved = Column(Boolean, default=True, server_default="1", nullable=False)
     created_at = Column(DateTime, default=utc_now, nullable=False)
 
     employee = relationship("Employee", back_populates="evaluation_themes")
+
+
+class CompanyPolicy(Base):
+    __tablename__ = "company_policies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    policy_code = Column(String(50), unique=True, index=True, nullable=False)
+    title = Column(String(255), nullable=False)
+    category = Column(String(100), nullable=False)
+    content = Column(Text, nullable=False)
+    summary = Column(Text, nullable=True)
+    version = Column(String(20), default="1.0", nullable=False)
+    is_active = Column(Boolean, default=True, server_default="1", nullable=False)
+    is_approved = Column(Boolean, default=True, server_default="1", nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+

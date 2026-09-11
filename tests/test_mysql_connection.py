@@ -1,7 +1,21 @@
 import pytest
 from sqlalchemy import inspect, text
-from app.db.session import engine, SessionLocal
-from app.models import Employee, PerformanceRecord, Goal, Skill, TaskOutcome, EvaluationTheme
+from sqlalchemy.exc import SQLAlchemyError
+
+from app.db.session import SessionLocal, engine
+from app.models import (
+    Employee,
+)
+
+
+def _is_mysql_available() -> bool:
+    try:
+        with engine.connect() as conn:
+            return conn.execute(text("SELECT 1")).scalar() == 1
+    except (SQLAlchemyError, OSError):
+        return False
+
+pytestmark = pytest.mark.skipif(not _is_mysql_available(), reason="MySQL database is not reachable")
 
 def test_mysql_connection():
     with engine.connect() as conn:

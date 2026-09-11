@@ -1,9 +1,10 @@
 import os
-import sys
 import sqlite3
-from datetime import datetime
-from dotenv import load_dotenv
+import sys
+from datetime import datetime, timezone
+
 import pymysql
+from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -11,30 +12,34 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from app.db.session import Base, engine, SessionLocal, DATABASE_URL
+from app.db.session import Base, SessionLocal, engine
 from app.models import (
+    CompanyPolicy,
     Employee,
-    PerformanceRecord,
+    EvaluationTheme,
     Goal,
+    PerformanceRecord,
     Skill,
     TaskOutcome,
-    EvaluationTheme,
 )
+
 
 def parse_date(date_str):
     if not date_str:
-        return datetime.utcnow()
+        return datetime.now(timezone.utc)
     if isinstance(date_str, datetime):
-        return date_str
+        return date_str if date_str.tzinfo else date_str.replace(tzinfo=timezone.utc)
     try:
-        return datetime.fromisoformat(date_str)
-    except Exception:
+        dt = datetime.fromisoformat(date_str)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
         for fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
             try:
-                return datetime.strptime(date_str, fmt)
+                dt = datetime.strptime(date_str, fmt).replace(tzinfo=timezone.utc)
+                return dt
             except ValueError:
                 pass
-    return datetime.utcnow()
+    return datetime.now(timezone.utc)
 
 def ensure_database_exists():
     db_user = os.getenv('DB_USER', 'root')
@@ -176,6 +181,29 @@ def migrate_data():
                 db.add(th)
         db.commit()
 
+        try:
+            sqlite_policies = sqlite_conn.execute('SELECT * FROM company_policies').fetchall()
+            print(f'Migrating {len(sqlite_policies)} Company Policies...')
+            for row in sqlite_policies:
+                existing = db.query(CompanyPolicy).filter(CompanyPolicy.policy_code == row['policy_code']).first()
+                if not existing:
+                    pol = CompanyPolicy(
+                        id=row['id'],
+                        policy_code=row['policy_code'],
+                        title=row['title'],
+                        category=row['category'],
+                        content=row['content'],
+                        summary=row['summary'],
+                        version=row['version'],
+                        is_active=bool(row['is_active']),
+                        is_approved=bool(row['is_approved']),
+                        created_at=parse_date(row['created_at']),
+                    )
+                    db.add(pol)
+            db.commit()
+        except sqlite3.OperationalError:
+            pass
+
         print('Verification Report in MySQL:')
         counts = {
             'employees': db.query(Employee).count(),
@@ -184,6 +212,7 @@ def migrate_data():
             'skills': db.query(Skill).count(),
             'task_outcomes': db.query(TaskOutcome).count(),
             'evaluation_themes': db.query(EvaluationTheme).count(),
+            'company_policies': db.query(CompanyPolicy).count(),
         }
         for table, count in counts.items():
             print(f'  Table {table}: {count} records in MySQL')

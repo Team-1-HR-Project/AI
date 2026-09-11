@@ -1,24 +1,25 @@
-﻿import json
+import json
 import os
 from unittest.mock import MagicMock, patch
+
 import pytest
+from groq import APIConnectionError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-from groq import APIConnectionError
 
 from app.db.session import Base
 from app.models import (
     Employee,
-    PerformanceRecord,
+    EvaluationTheme,
     Goal,
+    PerformanceRecord,
     Skill,
     TaskOutcome,
-    EvaluationTheme,
 )
 from app.schemas.career_coach import (
-    CareerCoachSuccessResponse,
     CareerCoachInsufficientDataResponse,
+    CareerCoachSuccessResponse,
 )
 from app.services.career_coach_ai import (
     CareerCoachAIService,
@@ -106,25 +107,41 @@ def seed_data(db):
 
 MOCK_VALID_GROQ_JSON = json.dumps({
     "status": "success",
-    "employee_id": "EMP-A",
     "strengths": [
         {
             "title": "Backend Optimization & Resiliency",
             "description": "Consistently delivers high-efficiency service refactors.",
-            "evidence": ["96% task completion rate", "Latency reduced by 50%"]
+            "evidence": [
+                {
+                    "source_type": "performance",
+                    "source_id": 1,
+                    "claim": "96% task completion rate"
+                },
+                {
+                    "source_type": "task_outcome",
+                    "source_id": 1,
+                    "claim": "Latency reduced by 50%"
+                }
+            ]
         }
     ],
     "development_areas": [
         {
             "title": "Cross-Functional System Documentation",
             "description": "Expand architecture documentation for junior peers.",
-            "evidence": ["Evaluation theme highlighted opportunities for peer guidance"],
+            "evidence": [
+                {
+                    "source_type": "evaluation_theme",
+                    "source_id": 1,
+                    "claim": "Evaluation theme highlighted opportunities for peer guidance"
+                }
+            ],
             "priority": "medium"
         }
     ],
     "development_plan": [
         {
-            "action": "Author API Gateway RFC Document",
+            "action": "Author API Gateway RFC Document and Conduct Knowledge Sharing",
             "reason": "Ensure cross-functional alignment before rollout.",
             "measurable_target": "Publish draft RFC and gather 3 peer reviews",
             "suggested_timeline": "30 days"
@@ -133,8 +150,7 @@ MOCK_VALID_GROQ_JSON = json.dumps({
     "follow_up": {
         "checkpoint": "End of Q3 Sprint 4",
         "review_focus": "Review RFC feedback and benchmark latency improvements"
-    },
-    "created_at": "2026-09-07T12:00:00Z"
+    }
 })
 
 
@@ -152,6 +168,7 @@ def test_successful_career_coach_generation(db, seed_data):
     assert result.status == "success"
     assert result.employee_id == "EMP-A"
     assert len(result.strengths) == 1
+    assert result.strengths[0].evidence[0].source_type == "performance"
     assert result.development_areas[0].priority.value == "medium"
     assert len(result.development_plan) == 1
     assert result.development_plan[0].suggested_timeline == "30 days"
@@ -186,8 +203,7 @@ def test_insufficient_data_skips_groq(db):
 def test_invalid_ai_response_rejected(db, seed_data):
     # Missing required fields
     invalid_json = json.dumps({
-        "status": "success",
-        "employee_id": "EMP-A"
+        "status": "success"
         # Missing strengths, development_areas, development_plan, follow_up
     })
 
@@ -250,10 +266,10 @@ def test_employee_isolation(db, seed_data):
 
 # 6. Configuration: Verify GROQ_API_KEY and GROQ_MODEL are read from environment
 def test_configuration_from_env():
-    with patch.dict(os.environ, {"GROQ_API_KEY": "test-env-key", "GROQ_MODEL": "llama-3.3-70b-versatile"}):
+    with patch.dict(os.environ, {"GROQ_API_KEY": "test-env-key", "GROQ_MODEL": "openai/gpt-oss-120b"}):
         service = CareerCoachAIService()
         assert service.api_key == "test-env-key"
-        assert service.model == "llama-3.3-70b-versatile"
+        assert service.model == "openai/gpt-oss-120b"
 
 def test_missing_api_key_raises_error(db, seed_data):
     with patch.dict(os.environ, {}, clear=True):
@@ -266,13 +282,13 @@ def test_missing_api_key_raises_error(db, seed_data):
 # 7. Groq API failure: Mock a Groq API exception and verify it is handled safely
 def test_groq_api_failure_handled_safely(db, seed_data):
     mock_client = MagicMock()
-    mock_client.chat.completions.create.side_effect = APIConnectionError(request=MagicMock())
+    mock_client.chat.completions.create.side_effect = APIConnectionError(message="Connection error", request=MagicMock())
 
-    service = CareerCoachAIService(api_key="secret-api-key-12345", client=mock_client)
+    service = CareerCoachAIService(api_key="secret-api-key-12345", client=mock_client, max_retries=0)
 
     with pytest.raises(CareerCoachAIServiceError) as exc_info:
         service.generate_career_plan(db, employee_id="EMP-A", period="2026-Q3")
 
     # Crucial: Error message must NEVER leak the API key
     assert "secret-api-key-12345" not in str(exc_info.value)
-    assert "Groq API error encountered" in str(exc_info.value)
+    assert "temporarily unavailable" in str(exc_info.value)
