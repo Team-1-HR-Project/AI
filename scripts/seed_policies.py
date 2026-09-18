@@ -1,4 +1,4 @@
-﻿"""Seed script for company policies in MySQL and SQLite."""
+"""Seed script for company policies in MySQL and SQLite."""
 
 import os
 import sys
@@ -13,7 +13,15 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from app.db.session import Base, SessionLocal, engine
-from app.models import CompanyPolicy
+from app.models import (
+    CompanyPolicy,
+    Employee,
+    EvaluationTheme,
+    Goal,
+    PerformanceRecord,
+    Skill,
+    TaskOutcome,
+)
 
 DEMO_POLICIES = [
     {
@@ -102,12 +110,14 @@ DEMO_POLICIES = [
 ]
 
 
-def seed_company_policies() -> list[CompanyPolicy]:
+def seed_company_policies(db=None) -> list[CompanyPolicy]:
     """Ensures policy table exists and seeds demo company policies idempotently."""
-    print("Ensuring database tables exist...")
-    Base.metadata.create_all(bind=engine)
+    should_close = False
+    if db is None:
+        Base.metadata.create_all(bind=engine)
+        db = SessionLocal()
+        should_close = True
 
-    db = SessionLocal()
     inserted_or_updated = []
     try:
         for policy_data in DEMO_POLICIES:
@@ -126,7 +136,6 @@ def seed_company_policies() -> list[CompanyPolicy]:
                 existing.is_active = policy_data["is_active"]
                 existing.is_approved = policy_data["is_approved"]
                 inserted_or_updated.append(existing)
-                print(f"Updated policy: {existing.policy_code} - {existing.title}")
             else:
                 new_policy = CompanyPolicy(
                     policy_code=policy_data["policy_code"],
@@ -141,18 +150,377 @@ def seed_company_policies() -> list[CompanyPolicy]:
                 )
                 db.add(new_policy)
                 inserted_or_updated.append(new_policy)
-                print(f"Inserted policy: {new_policy.policy_code} - {new_policy.title}")
 
         db.commit()
-        print(f"Successfully seeded {len(inserted_or_updated)} company policies.")
         return inserted_or_updated
     except Exception as exc:
         db.rollback()
         print(f"Error seeding company policies: {exc}")
         raise
     finally:
-        db.close()
+        if should_close:
+            db.close()
+
+
+# ===========================================================================
+# Demo Performance Insight Data (Development / Manual Testing Only)
+# ===========================================================================
+DEMO_PERF_INSIGHT_EMPLOYEE = {
+    "id": "EMP-PERF-DEMO",
+    "first_name": "Demo",
+    "last_name": "Performance",
+    "role_title": "Senior Systems Engineer",
+    "department": "Engineering",
+}
+
+DEMO_PERF_INSIGHT_RECORDS = [
+    {
+        "period": "2026-Q2",
+        "overall_score": 82.0,
+        "task_completion_rate": 85.0,
+        "goal_achievement_rate": 80.0,
+        "attendance_rate": 96.0,
+        "is_approved": True,
+    },
+    {
+        "period": "2026-Q3",
+        "overall_score": 90.0,
+        "task_completion_rate": 93.0,
+        "goal_achievement_rate": 88.0,
+        "attendance_rate": 94.0,
+        "is_approved": True,
+    },
+]
+
+
+def seed_performance_insight_demo(db=None) -> tuple[Employee, list[PerformanceRecord]]:
+    """Seeds dedicated demo employee and approved performance records for manual testing.
+
+    Idempotent:
+    - If employee exists, updates profile attributes; otherwise creates it.
+    - If records exist for (employee_id, period), updates metrics; otherwise creates them.
+    - Cleans up any duplicate records for the same period.
+    - Leaves all other employee and performance records untouched.
+    - This data is strictly for development, demo, and manual testing.
+    """
+    should_close = False
+    if db is None:
+        Base.metadata.create_all(bind=engine)
+        db = SessionLocal()
+        should_close = True
+
+    try:
+        emp_data = DEMO_PERF_INSIGHT_EMPLOYEE
+        employee = db.query(Employee).filter(Employee.id == emp_data["id"]).first()
+        if employee:
+            employee.first_name = emp_data["first_name"]
+            employee.last_name = emp_data["last_name"]
+            employee.role_title = emp_data["role_title"]
+            employee.department = emp_data["department"]
+        else:
+            employee = Employee(
+                id=emp_data["id"],
+                first_name=emp_data["first_name"],
+                last_name=emp_data["last_name"],
+                role_title=emp_data["role_title"],
+                department=emp_data["department"],
+                created_at=datetime.now(timezone.utc),
+            )
+            db.add(employee)
+
+        db.flush()
+
+        seeded_records = []
+        for rec_data in DEMO_PERF_INSIGHT_RECORDS:
+            existing_records = (
+                db.query(PerformanceRecord)
+                .filter(
+                    PerformanceRecord.employee_id == emp_data["id"],
+                    PerformanceRecord.period == rec_data["period"],
+                )
+                .all()
+            )
+            if existing_records:
+                record = existing_records[0]
+                record.overall_score = rec_data["overall_score"]
+                record.task_completion_rate = rec_data["task_completion_rate"]
+                record.goal_achievement_rate = rec_data["goal_achievement_rate"]
+                record.attendance_rate = rec_data["attendance_rate"]
+                record.is_approved = rec_data["is_approved"]
+                for duplicate in existing_records[1:]:
+                    db.delete(duplicate)
+                seeded_records.append(record)
+            else:
+                record = PerformanceRecord(
+                    employee_id=emp_data["id"],
+                    period=rec_data["period"],
+                    overall_score=rec_data["overall_score"],
+                    task_completion_rate=rec_data["task_completion_rate"],
+                    goal_achievement_rate=rec_data["goal_achievement_rate"],
+                    attendance_rate=rec_data["attendance_rate"],
+                    is_approved=rec_data["is_approved"],
+                    created_at=datetime.now(timezone.utc),
+                )
+                db.add(record)
+                seeded_records.append(record)
+
+        db.commit()
+        return employee, seeded_records
+    except Exception as exc:
+        db.rollback()
+        print(f"Error seeding performance insight demo data: {exc}")
+        raise
+    finally:
+        if should_close:
+            db.close()
+
+
+# ===========================================================================
+# Manual Test Employee Data (EMP-MANUAL-TEST)
+# ===========================================================================
+DEMO_MANUAL_TEST_EMPLOYEE = {
+    "id": "EMP-MANUAL-TEST",
+    "first_name": "Alex",
+    "last_name": "Taylor",
+    "role_title": "Senior Backend Engineer",
+    "department": "Platform Engineering",
+}
+
+DEMO_MANUAL_TEST_PERFORMANCE = {
+    "period": "2026-Q3",
+    "overall_score": 93.5,
+    "task_completion_rate": 96.0,
+    "goal_achievement_rate": 91.0,
+    "attendance_rate": 99.0,
+    "is_approved": True,
+}
+
+DEMO_MANUAL_TEST_GOAL = {
+    "title": "Migrate distributed caching to Redis Cluster",
+    "progress": 85.0,
+    "status": "in_progress",
+    "deadline": "2026-10-30",
+    "period": "2026-Q3",
+    "is_approved": True,
+}
+
+DEMO_MANUAL_TEST_SKILL = {
+    "name": "Python, FastAPI & Async Architecture",
+    "level": "Expert",
+    "evidence": "Architected core event-driven API gateway with 99.95% uptime",
+    "is_approved": True,
+}
+
+DEMO_MANUAL_TEST_TASK_OUTCOME = {
+    "title": "Database Query Indexing & Connection Pooling Refactor",
+    "status": "completed",
+    "outcome": "Reduced P99 API response latency by 42% under load",
+    "completion_date": "2026-08-20",
+    "period": "2026-Q3",
+    "is_approved": True,
+}
+
+DEMO_MANUAL_TEST_EVALUATION_THEME = {
+    "theme": "Technical Problem Solving & Mentorship",
+    "sentiment": "positive",
+    "evidence": "Excellent root cause analysis; opportunity to run more knowledge sharing sessions for junior peers",
+    "period": "2026-Q3",
+    "is_approved": True,
+}
+
+
+def seed_manual_test_data(db=None) -> Employee:
+    """Ensures EMP-MANUAL-TEST and its related records exist for manual testing and CI.
+
+    Idempotent:
+    - If employee exists, updates profile attributes; otherwise creates it.
+    - If related records exist, updates their fields; otherwise creates them.
+    - Leaves all other employee and performance records untouched.
+    """
+    should_close = False
+    if db is None:
+        Base.metadata.create_all(bind=engine)
+        db = SessionLocal()
+        should_close = True
+
+    try:
+        emp_data = DEMO_MANUAL_TEST_EMPLOYEE
+        employee = db.query(Employee).filter(Employee.id == emp_data["id"]).first()
+        if employee:
+            employee.first_name = emp_data["first_name"]
+            employee.last_name = emp_data["last_name"]
+            employee.role_title = emp_data["role_title"]
+            employee.department = emp_data["department"]
+        else:
+            employee = Employee(
+                id=emp_data["id"],
+                first_name=emp_data["first_name"],
+                last_name=emp_data["last_name"],
+                role_title=emp_data["role_title"],
+                department=emp_data["department"],
+                created_at=datetime.now(timezone.utc),
+            )
+            db.add(employee)
+
+        db.flush()
+
+        # Performance Record
+        perf_data = DEMO_MANUAL_TEST_PERFORMANCE
+        perf = (
+            db.query(PerformanceRecord)
+            .filter(
+                PerformanceRecord.employee_id == emp_data["id"],
+                PerformanceRecord.period == perf_data["period"],
+            )
+            .first()
+        )
+        if perf:
+            perf.overall_score = perf_data["overall_score"]
+            perf.task_completion_rate = perf_data["task_completion_rate"]
+            perf.goal_achievement_rate = perf_data["goal_achievement_rate"]
+            perf.attendance_rate = perf_data["attendance_rate"]
+            perf.is_approved = perf_data["is_approved"]
+        else:
+            perf = PerformanceRecord(
+                employee_id=emp_data["id"],
+                period=perf_data["period"],
+                overall_score=perf_data["overall_score"],
+                task_completion_rate=perf_data["task_completion_rate"],
+                goal_achievement_rate=perf_data["goal_achievement_rate"],
+                attendance_rate=perf_data["attendance_rate"],
+                is_approved=perf_data["is_approved"],
+                created_at=datetime.now(timezone.utc),
+            )
+            db.add(perf)
+
+        # Goal
+        goal_data = DEMO_MANUAL_TEST_GOAL
+        goal = (
+            db.query(Goal)
+            .filter(
+                Goal.employee_id == emp_data["id"],
+                Goal.title == goal_data["title"],
+            )
+            .first()
+        )
+        if goal:
+            goal.progress = goal_data["progress"]
+            goal.status = goal_data["status"]
+            goal.deadline = goal_data["deadline"]
+            goal.period = goal_data["period"]
+            goal.is_approved = goal_data["is_approved"]
+        else:
+            goal = Goal(
+                employee_id=emp_data["id"],
+                title=goal_data["title"],
+                progress=goal_data["progress"],
+                status=goal_data["status"],
+                deadline=goal_data["deadline"],
+                period=goal_data["period"],
+                is_approved=goal_data["is_approved"],
+                created_at=datetime.now(timezone.utc),
+            )
+            db.add(goal)
+
+        # Skill
+        skill_data = DEMO_MANUAL_TEST_SKILL
+        skill = (
+            db.query(Skill)
+            .filter(
+                Skill.employee_id == emp_data["id"],
+                Skill.name == skill_data["name"],
+            )
+            .first()
+        )
+        if skill:
+            skill.level = skill_data["level"]
+            skill.evidence = skill_data["evidence"]
+            skill.is_approved = skill_data["is_approved"]
+        else:
+            skill = Skill(
+                employee_id=emp_data["id"],
+                name=skill_data["name"],
+                level=skill_data["level"],
+                evidence=skill_data["evidence"],
+                is_approved=skill_data["is_approved"],
+                created_at=datetime.now(timezone.utc),
+            )
+            db.add(skill)
+
+        # Task Outcome
+        task_data = DEMO_MANUAL_TEST_TASK_OUTCOME
+        task = (
+            db.query(TaskOutcome)
+            .filter(
+                TaskOutcome.employee_id == emp_data["id"],
+                TaskOutcome.title == task_data["title"],
+            )
+            .first()
+        )
+        if task:
+            task.status = task_data["status"]
+            task.outcome = task_data["outcome"]
+            task.completion_date = task_data["completion_date"]
+            task.period = task_data["period"]
+            task.is_approved = task_data["is_approved"]
+        else:
+            task = TaskOutcome(
+                employee_id=emp_data["id"],
+                title=task_data["title"],
+                status=task_data["status"],
+                outcome=task_data["outcome"],
+                completion_date=task_data["completion_date"],
+                period=task_data["period"],
+                is_approved=task_data["is_approved"],
+                created_at=datetime.now(timezone.utc),
+            )
+            db.add(task)
+
+        # Evaluation Theme
+        theme_data = DEMO_MANUAL_TEST_EVALUATION_THEME
+        theme = (
+            db.query(EvaluationTheme)
+            .filter(
+                EvaluationTheme.employee_id == emp_data["id"],
+                EvaluationTheme.theme == theme_data["theme"],
+            )
+            .first()
+        )
+        if theme:
+            theme.sentiment = theme_data["sentiment"]
+            theme.evidence = theme_data["evidence"]
+            theme.period = theme_data["period"]
+            theme.is_approved = theme_data["is_approved"]
+        else:
+            theme = EvaluationTheme(
+                employee_id=emp_data["id"],
+                theme=theme_data["theme"],
+                sentiment=theme_data["sentiment"],
+                evidence=theme_data["evidence"],
+                period=theme_data["period"],
+                is_approved=theme_data["is_approved"],
+                created_at=datetime.now(timezone.utc),
+            )
+            db.add(theme)
+
+        db.commit()
+        return employee
+    except Exception as exc:
+        db.rollback()
+        print(f"Error seeding manual test data: {exc}")
+        raise
+    finally:
+        if should_close:
+            db.close()
+
+
+def seed_all(db=None):
+    """Seeds company policies, manual test data, and demo performance insight data."""
+    seed_company_policies(db=db)
+    seed_manual_test_data(db=db)
+    seed_performance_insight_demo(db=db)
 
 
 if __name__ == "__main__":
-    seed_company_policies()
+    seed_all()
+

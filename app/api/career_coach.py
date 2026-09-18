@@ -1,3 +1,5 @@
+import logging
+import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -6,6 +8,8 @@ from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.schemas.career_coach import CareerCoachRequest, CareerCoachResponse
 from app.services.career_coach_ai import CareerCoachAIService, CareerCoachAIServiceError
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -38,10 +42,17 @@ def generate_career_coach(
             employee_id=request.employee_id,
             period=request.period,
         )
-    except CareerCoachAIServiceError as err:
-        # Cleanly return a controlled HTTP error without leaking secrets or stack traces
+    except CareerCoachAIServiceError:
+        error_id = str(uuid.uuid4())
+        logger.exception(
+            "Career Coach AI service error [Reference ID: %s]",
+            error_id,
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=str(err),
+            detail=f"AI service temporarily unavailable. Reference ID: {error_id}",
         ) from None
+
+
+
 

@@ -1,5 +1,7 @@
 """API router for the AI HR Policy Assistant."""
 
+import logging
+import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -10,7 +12,14 @@ from app.schemas.policy_assistant import (
     PolicyAssistantResponse,
     PolicyQuestionRequest,
 )
-from app.services.policy_ai import PolicyAIService, PolicyAIServiceError
+from app.services.policy_ai import (
+    ChatSessionAccessDeniedError,
+    ChatSessionNotFoundError,
+    PolicyAIService,
+    PolicyAIServiceError,
+)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -45,10 +54,28 @@ def ask_policy_assistant(
             db=db,
             employee_id=request.employee_id,
             question=request.question,
+            session_id=request.session_id,
         )
-    except PolicyAIServiceError as err:
-        # Return HTTP 502 without exposing stack traces, raw provider errors, or secrets
+    except ChatSessionNotFoundError as exc:
+        logger.warning("Policy Assistant session not found: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Chat session not found.",
+        ) from None
+    except ChatSessionAccessDeniedError as exc:
+        logger.warning("Policy Assistant cross-employee access denied: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: session belongs to another employee.",
+        ) from None
+    except PolicyAIServiceError:
+        error_id = str(uuid.uuid4())
+        logger.exception(
+            "Policy Assistant AI service error [Reference ID: %s]",
+            error_id,
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=str(err),
+            detail=f"AI service temporarily unavailable. Reference ID: {error_id}",
         ) from None
+

@@ -1,0 +1,56 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: rootpassword
+          MYSQL_DATABASE: hr_system
+        ports:
+          - 3306:3306
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff pytest pytest-asyncio
+
+      - name: Run Ruff Lint Checks
+        run: |
+          ruff check app scripts tests
+
+      - name: Seed MySQL Test Database
+        env:
+          DATABASE_URL: mysql+pymysql://root:rootpassword@127.0.0.1:3306/hr_system?charset=utf8mb4
+        run: |
+          python scripts/seed_policies.py
+
+      - name: Run Tests
+        env:
+          DATABASE_URL: mysql+pymysql://root:rootpassword@127.0.0.1:3306/hr_system?charset=utf8mb4
+          GROQ_API_KEY: gsk_ci_test_placeholder_key
+          GROQ_MODEL: openai/gpt-oss-120b
+        run: |
+          pytest -v
+

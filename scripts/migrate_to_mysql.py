@@ -12,6 +12,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+from app.db.migrations import migrate_is_approved_columns
 from app.db.session import Base, SessionLocal, engine
 from app.models import (
     CompanyPolicy,
@@ -40,6 +41,18 @@ def parse_date(date_str):
             except ValueError:
                 pass
     return datetime.now(timezone.utc)
+
+def parse_is_approved(row) -> bool:
+    """Fail-closed extraction of is_approved state from source rows.
+
+    - Preserves explicit True / 1 as True.
+    - Preserves explicit False / 0 as False.
+    - Legacy schemas (column missing) default to False.
+    - NULL/None/unknown values default to False.
+    """
+    if "is_approved" in row and row["is_approved"] is not None:
+        return bool(row["is_approved"])
+    return False
 
 def ensure_database_exists():
     db_user = os.getenv('DB_USER', 'root')
@@ -71,6 +84,8 @@ def migrate_data():
 
     print('Creating tables in MySQL if not present...')
     Base.metadata.create_all(bind=engine)
+    print('Checking and migrating is_approved columns if missing...')
+    migrate_is_approved_columns(bind=engine, default_for_legacy=False)
 
     print(f'Reading records from SQLite source: {sqlite_path}...')
     sqlite_conn = sqlite3.connect(sqlite_path)
@@ -107,6 +122,7 @@ def migrate_data():
                     task_completion_rate=row['task_completion_rate'],
                     goal_achievement_rate=row['goal_achievement_rate'],
                     attendance_rate=row['attendance_rate'],
+                    is_approved=parse_is_approved(row),
                     created_at=parse_date(row['created_at']),
                 )
                 db.add(rec)
@@ -125,6 +141,7 @@ def migrate_data():
                     status=row['status'],
                     deadline=row['deadline'],
                     period=row['period'],
+                    is_approved=parse_is_approved(row),
                     created_at=parse_date(row['created_at']),
                 )
                 db.add(g)
@@ -141,6 +158,7 @@ def migrate_data():
                     name=row['name'],
                     level=row['level'],
                     evidence=row['evidence'],
+                    is_approved=parse_is_approved(row),
                     created_at=parse_date(row['created_at']),
                 )
                 db.add(s)
@@ -159,6 +177,7 @@ def migrate_data():
                     outcome=row['outcome'],
                     completion_date=row['completion_date'],
                     period=row['period'],
+                    is_approved=parse_is_approved(row),
                     created_at=parse_date(row['created_at']),
                 )
                 db.add(t)
@@ -176,6 +195,7 @@ def migrate_data():
                     sentiment=row['sentiment'],
                     evidence=row['evidence'],
                     period=row['period'],
+                    is_approved=parse_is_approved(row),
                     created_at=parse_date(row['created_at']),
                 )
                 db.add(th)
@@ -186,7 +206,25 @@ def migrate_data():
             print(f'Migrating {len(sqlite_policies)} Company Policies...')
             for row in sqlite_policies:
                 existing = db.query(CompanyPolicy).filter(CompanyPolicy.policy_code == row['policy_code']).first()
-                if not existing:
+                if existing:
+                    # P2-2: Safe upsert strategy - update fields if content/version has changed, preserving id and created_at
+                    if (
+                        existing.version != row['version']
+                        or existing.content != row['content']
+                        or existing.summary != row['summary']
+                        or existing.title != row['title']
+                        or existing.category != row['category']
+                        or existing.is_active != bool(row['is_active'])
+                        or existing.is_approved != bool(row['is_approved'])
+                    ):
+                        existing.title = row['title']
+                        existing.category = row['category']
+                        existing.content = row['content']
+                        existing.summary = row['summary']
+                        existing.version = row['version']
+                        existing.is_active = bool(row['is_active'])
+                        existing.is_approved = bool(row['is_approved'])
+                else:
                     pol = CompanyPolicy(
                         id=row['id'],
                         policy_code=row['policy_code'],

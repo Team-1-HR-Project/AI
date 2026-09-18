@@ -1,4 +1,4 @@
-﻿import pytest
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -155,6 +155,13 @@ def test_employee_and_all_related_models(db_session):
     assert len(saved_emp.evaluation_themes) == 1
     assert saved_emp.evaluation_themes[0].sentiment == "positive"
     assert saved_emp.evaluation_themes[0].employee.id == saved_emp.id
+
+    # Requirement 4: newly created records default to is_approved=False
+    assert saved_emp.performance_records[0].is_approved is False
+    assert saved_emp.goals[0].is_approved is False
+    assert saved_emp.skills[0].is_approved is False
+    assert saved_emp.task_outcomes[0].is_approved is False
+    assert saved_emp.evaluation_themes[0].is_approved is False
 
 # 3. Verify cascade delete works properly
 def test_cascade_delete(db_session):

@@ -73,6 +73,7 @@ def seed_data(db):
         task_completion_rate=96.0,
         goal_achievement_rate=92.0,
         attendance_rate=99.0,
+        is_approved=True,
     ))
     db.add(Goal(
         employee_id="EMP-A",
@@ -80,12 +81,14 @@ def seed_data(db):
         progress=85.0,
         status="in_progress",
         period="2026-Q3",
+        is_approved=True,
     ))
     db.add(Skill(
         employee_id="EMP-A",
         name="Python & FastAPI",
         level="Expert",
         evidence="Built high throughput microservices",
+        is_approved=True,
     ))
     db.add(TaskOutcome(
         employee_id="EMP-A",
@@ -93,6 +96,7 @@ def seed_data(db):
         status="completed",
         outcome="Latency reduced by 50%",
         period="2026-Q3",
+        is_approved=True,
     ))
     db.add(EvaluationTheme(
         employee_id="EMP-A",
@@ -100,6 +104,7 @@ def seed_data(db):
         sentiment="positive",
         evidence="Rapid debugging under high traffic",
         period="2026-Q3",
+        is_approved=True,
     ))
 
     db.commit()
@@ -133,7 +138,7 @@ MOCK_VALID_GROQ_JSON = json.dumps({
                 {
                     "source_type": "evaluation_theme",
                     "source_id": 1,
-                    "claim": "Evaluation theme highlighted opportunities for peer guidance"
+                    "claim": "Evaluation theme demonstrated technical problem solving and rapid debugging"
                 }
             ],
             "priority": "medium"
@@ -292,3 +297,16 @@ def test_groq_api_failure_handled_safely(db, seed_data):
     # Crucial: Error message must NEVER leak the API key
     assert "secret-api-key-12345" not in str(exc_info.value)
     assert "temporarily unavailable" in str(exc_info.value)
+
+
+# 8. Request deadline enforcement
+def test_career_coach_deadline_exceeded(db, seed_data, monkeypatch):
+    mock_client = MagicMock()
+    service = CareerCoachAIService(api_key="mock-key", client=mock_client)
+
+    monkeypatch.setenv("AI_REQUEST_DEADLINE_SECONDS", "-1.0")
+
+    with pytest.raises(CareerCoachAIServiceError) as exc_info:
+        service.generate_career_plan(db, employee_id="EMP-A", period="2026-Q3")
+    assert "deadline exceeded" in str(exc_info.value)
+

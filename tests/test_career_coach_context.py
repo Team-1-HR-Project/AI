@@ -64,7 +64,8 @@ def seed_data(db):
         overall_score=92.0,
         task_completion_rate=95.0,
         goal_achievement_rate=90.0,
-        attendance_rate=98.0
+        attendance_rate=98.0,
+        is_approved=True,
     ))
     # Employee A Records - Q2
     db.add(PerformanceRecord(
@@ -73,34 +74,39 @@ def seed_data(db):
         overall_score=85.0,
         task_completion_rate=88.0,
         goal_achievement_rate=80.0,
-        attendance_rate=97.0
+        attendance_rate=97.0,
+        is_approved=True,
     ))
     db.add(Goal(
         employee_id="EMP-A",
         title="Migrate microservices",
         progress=75.0,
         status="in_progress",
-        period="2026-Q3"
+        period="2026-Q3",
+        is_approved=True,
     ))
     db.add(Skill(
         employee_id="EMP-A",
         name="Python & FastAPI",
         level="Advanced",
-        evidence="Led backend revamp"
+        evidence="Led backend revamp",
+        is_approved=True,
     ))
     db.add(TaskOutcome(
         employee_id="EMP-A",
         title="API performance optimization",
         status="completed",
         outcome="Latency reduced by 40%",
-        period="2026-Q3"
+        period="2026-Q3",
+        is_approved=True,
     ))
     db.add(EvaluationTheme(
         employee_id="EMP-A",
         theme="Technical Problem Solving",
         sentiment="positive",
         evidence="Proactive root cause analysis",
-        period="2026-Q3"
+        period="2026-Q3",
+        is_approved=True,
     ))
 
     # Employee B Records (Distinct data)
@@ -110,34 +116,39 @@ def seed_data(db):
         overall_score=78.0,
         task_completion_rate=80.0,
         goal_achievement_rate=75.0,
-        attendance_rate=92.0
+        attendance_rate=92.0,
+        is_approved=True,
     ))
     db.add(Goal(
         employee_id="EMP-B",
         title="Close enterprise clients",
         progress=50.0,
         status="in_progress",
-        period="2026-Q3"
+        period="2026-Q3",
+        is_approved=True,
     ))
     db.add(Skill(
         employee_id="EMP-B",
         name="Enterprise Sales",
         level="Intermediate",
-        evidence="Closed 3 deals"
+        evidence="Closed 3 deals",
+        is_approved=True,
     ))
     db.add(TaskOutcome(
         employee_id="EMP-B",
         title="Outbound client campaign",
         status="completed",
         outcome="Generated 25 qualified leads",
-        period="2026-Q3"
+        period="2026-Q3",
+        is_approved=True,
     ))
     db.add(EvaluationTheme(
         employee_id="EMP-B",
         theme="Client Negotiation",
         sentiment="positive",
         evidence="Strong empathy with prospects",
-        period="2026-Q3"
+        period="2026-Q3",
+        is_approved=True,
     ))
 
     db.commit()
@@ -320,10 +331,10 @@ def test_context_budget_limits_and_tracking(db):
             period="2026-Q3"
         ))
     # Add single records for other categories to fulfill sufficiency
-    db.add(PerformanceRecord(employee_id="EMP-LARGE", period="2026-Q3", overall_score=90.0, task_completion_rate=90.0, goal_achievement_rate=90.0, attendance_rate=99.0))
-    db.add(Skill(employee_id="EMP-LARGE", name="Architecture", level="Expert", evidence="Evidence"))
-    db.add(TaskOutcome(employee_id="EMP-LARGE", title="Task 1", status="completed", outcome="Outcome", period="2026-Q3"))
-    db.add(EvaluationTheme(employee_id="EMP-LARGE", theme="Design", sentiment="positive", evidence="Theme evidence", period="2026-Q3"))
+    db.add(PerformanceRecord(employee_id="EMP-LARGE", period="2026-Q3", overall_score=90.0, task_completion_rate=90.0, goal_achievement_rate=90.0, attendance_rate=99.0, is_approved=True))
+    db.add(Skill(employee_id="EMP-LARGE", name="Architecture", level="Expert", evidence="Evidence", is_approved=True))
+    db.add(TaskOutcome(employee_id="EMP-LARGE", title="Task 1", status="completed", outcome="Outcome", period="2026-Q3", is_approved=True))
+    db.add(EvaluationTheme(employee_id="EMP-LARGE", theme="Design", sentiment="positive", evidence="Theme evidence", period="2026-Q3", is_approved=True))
     db.commit()
 
     result = CareerCoachContextBuilder.build_context(db, employee_id="EMP-LARGE", period="2026-Q3")
@@ -334,3 +345,135 @@ def test_context_budget_limits_and_tracking(db):
     assert len(result["selected_source_ids"]["goal"]) == 8
     # Long text should be truncated
     assert len(result["context"]["goals"][0]["title"]) <= 303
+
+
+# 9. P0-2: Fail-closed approval gate across all 5 HR models (False and NULL/None)
+def test_all_five_hr_models_fail_closed(db):
+    emp = Employee(
+        id="EMP-FAILCLOSED",
+        first_name="Frank",
+        last_name="FailClosed",
+        role_title="Security Analyst",
+        department="Security",
+    )
+    db.add(emp)
+    db.commit()
+
+    # Add unapproved (is_approved=False) records for all 5 models
+    p_unapproved = PerformanceRecord(
+        employee_id="EMP-FAILCLOSED",
+        period="2026-Q3",
+        overall_score=99.0,
+        task_completion_rate=99.0,
+        goal_achievement_rate=99.0,
+        attendance_rate=99.0,
+        is_approved=False,
+    )
+    g_unapproved = Goal(
+        employee_id="EMP-FAILCLOSED",
+        title="Unapproved Goal",
+        progress=100.0,
+        period="2026-Q3",
+        is_approved=False,
+    )
+    s_unapproved = Skill(
+        employee_id="EMP-FAILCLOSED",
+        name="Unapproved Skill",
+        level="Master",
+        evidence="Unverified",
+        is_approved=False,
+    )
+    t_unapproved = TaskOutcome(
+        employee_id="EMP-FAILCLOSED",
+        title="Unapproved Task",
+        status="completed",
+        outcome="Unverified task",
+        period="2026-Q3",
+        is_approved=False,
+    )
+    th_unapproved = EvaluationTheme(
+        employee_id="EMP-FAILCLOSED",
+        theme="Unapproved Theme",
+        sentiment="positive",
+        evidence="Unverified theme",
+        period="2026-Q3",
+        is_approved=False,
+    )
+
+    db.add_all([p_unapproved, g_unapproved, s_unapproved, t_unapproved, th_unapproved])
+    db.commit()
+
+    # Verify context builder filters out all unapproved records
+    result = CareerCoachContextBuilder.build_context(db, employee_id="EMP-FAILCLOSED", period="2026-Q3")
+    assert result["has_sufficient_data"] is False
+    assert set(result["missing_categories"]) == {
+        "performance",
+        "goals",
+        "skills",
+        "task_outcomes",
+        "evaluation_themes",
+    }
+    assert len(result["context"]["performance"]) == 0
+    assert len(result["context"]["goals"]) == 0
+    assert len(result["context"]["skills"]) == 0
+    assert len(result["context"]["task_outcomes"]) == 0
+    assert len(result["context"]["evaluation_themes"]) == 0
+    assert len(result["approved_sources"]) == 0
+
+    # Add approved records for each
+    p_approved = PerformanceRecord(
+        employee_id="EMP-FAILCLOSED",
+        period="2026-Q3",
+        overall_score=85.0,
+        task_completion_rate=85.0,
+        goal_achievement_rate=85.0,
+        attendance_rate=95.0,
+        is_approved=True,
+    )
+    g_approved = Goal(
+        employee_id="EMP-FAILCLOSED",
+        title="Approved Goal",
+        progress=80.0,
+        period="2026-Q3",
+        is_approved=True,
+    )
+    s_approved = Skill(
+        employee_id="EMP-FAILCLOSED",
+        name="Approved Skill",
+        level="Intermediate",
+        evidence="Verified",
+        is_approved=True,
+    )
+    t_approved = TaskOutcome(
+        employee_id="EMP-FAILCLOSED",
+        title="Approved Task",
+        status="completed",
+        outcome="Verified task",
+        period="2026-Q3",
+        is_approved=True,
+    )
+    th_approved = EvaluationTheme(
+        employee_id="EMP-FAILCLOSED",
+        theme="Approved Theme",
+        sentiment="positive",
+        evidence="Verified theme",
+        period="2026-Q3",
+        is_approved=True,
+    )
+
+    db.add_all([p_approved, g_approved, s_approved, t_approved, th_approved])
+    db.commit()
+
+    # Now verify context builder includes ONLY the approved records
+    res_after = CareerCoachContextBuilder.build_context(db, employee_id="EMP-FAILCLOSED", period="2026-Q3")
+    assert res_after["has_sufficient_data"] is True
+    assert len(res_after["context"]["performance"]) == 1
+    assert len(res_after["context"]["goals"]) == 1
+    assert res_after["context"]["goals"][0]["title"] == "Approved Goal"
+    assert len(res_after["context"]["skills"]) == 1
+    assert res_after["context"]["skills"][0]["name"] == "Approved Skill"
+    assert len(res_after["context"]["task_outcomes"]) == 1
+    assert res_after["context"]["task_outcomes"][0]["title"] == "Approved Task"
+    assert len(res_after["context"]["evaluation_themes"]) == 1
+    assert res_after["context"]["evaluation_themes"][0]["theme"] == "Approved Theme"
+

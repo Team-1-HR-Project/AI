@@ -4,6 +4,7 @@ Defines strict request models, source reference models, response models,
 and a discriminated union keyed by the "status" field.
 """
 
+import uuid
 from datetime import datetime, timezone
 from typing import Annotated, Literal
 
@@ -30,6 +31,12 @@ class PolicyQuestionRequest(BaseModel):
         min_length=3,
         max_length=1000,
         description="Employee question regarding company HR policies",
+    )
+    session_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        description="Optional unique identifier of an existing chat session",
     )
 
     model_config = ConfigDict(extra="forbid")
@@ -74,6 +81,12 @@ class PolicyAnswerResponse(BaseModel):
         "success",
         description="Status indicator for successful policy answer",
     )
+    session_id: str = Field(
+        default_factory=lambda: str(uuid.uuid4()),
+        min_length=1,
+        max_length=100,
+        description="Unique identifier of the chat session",
+    )
     employee_id: str = Field(
         ...,
         min_length=1,
@@ -112,6 +125,11 @@ class PolicyFallbackResponse(BaseModel):
     status: Literal["unsupported"] = Field(
         "unsupported",
         description="Status indicator for unsupported or out-of-scope question",
+    )
+    session_id: str | None = Field(
+        default=None,
+        max_length=100,
+        description="Unique identifier of the chat session, if established",
     )
     employee_id: str = Field(
         ...,

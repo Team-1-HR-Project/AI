@@ -239,7 +239,8 @@ def test_ai_service_error_handling(client, seed_employee):
 
     assert response.status_code == 502
     data = response.json()
-    assert "RateLimitError" in data["detail"]
+    assert "AI service temporarily unavailable. Reference ID:" in data["detail"]
+    assert "RateLimitError" not in data["detail"]
     # Verify no raw python traceback or internal keys in response
     assert "Traceback" not in response.text
     assert "gsk_" not in response.text
@@ -263,13 +264,13 @@ def test_career_coach_validation_extra_fields_rejected(client):
     assert response.status_code == 422
 
 
-# 6. OpenAPI contract: no path or query parameters, body has employee_id and period
+# 6. OpenAPI contract: no path or query parameters on primary endpoint, body has employee_id and period
 def test_career_coach_openapi_contract():
     openapi_schema = app.openapi()
     assert "/api/career-coach" in openapi_schema["paths"]
     endpoint_spec = openapi_schema["paths"]["/api/career-coach"]["post"]
 
-    # Verify no path or query parameters
+    # Verify no path or query parameters on primary body-based endpoint
     params = endpoint_spec.get("parameters", [])
     assert len(params) == 0
 
@@ -280,3 +281,14 @@ def test_career_coach_openapi_contract():
     assert "employee_id" in body_schema["properties"]
     assert "period" in body_schema["properties"]
     assert body_schema["required"] == ["employee_id"]
+
+    # Verify deprecated legacy endpoint does not exist in OpenAPI
+    assert "/api/career-coach/{employee_id}" not in openapi_schema["paths"]
+
+
+# 7. Verify removed deprecated endpoint returns 404
+def test_career_coach_legacy_endpoint_removed(client):
+    response = client.post("/api/career-coach/EMP-API-001")
+    assert response.status_code == 404
+
+

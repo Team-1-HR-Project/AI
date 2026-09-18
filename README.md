@@ -1,4 +1,4 @@
-﻿# Smart HR Management System - AI Career Coach Service
+# Smart HR Management System - AI Career Coach Service
 
 Backend service providing personalized, evidence-grounded employee development guidance using FastAPI, SQLAlchemy, and Groq LLMs (`openai/gpt-oss-120b`).
 
@@ -11,22 +11,25 @@ Backend service providing personalized, evidence-grounded employee development g
 Generates structured, evidence-based career development guidance for a target employee. Analyzes approved performance records, goals, skills, task outcomes, and evaluation themes.
 
 - **HTTP Method:** `POST`
-- **Path:** `/api/career-coach/{employee_id}`
+- **Path:** `/api/career-coach`
 - **Content-Type:** `application/json`
 
 ---
 
-### Parameters
+### Request Body (`POST /api/career-coach`)
 
-#### 1. Path Parameters
-| Name | Type | Required | Description | Example |
+| Field | Type | Required | Description | Example |
 | :--- | :--- | :--- | :--- | :--- |
-| `employee_id` | `string` | **Yes** | Unique identifier of the target employee | `EMP-001` |
+| `employee_id` | `string` | **Yes** | Unique identifier of the target employee | `"EMP-001"` |
+| `period` | `string` | No | Target performance/review cycle period | `"2026-Q3"` |
 
-#### 2. Query Parameters
-| Name | Type | Required | Description | Example |
-| :--- | :--- | :--- | :--- | :--- |
-| `period` | `string` | No | Target performance/review cycle period (e.g., quarterly) | `2026-Q3` |
+Request payload example:
+```json
+{
+  "employee_id": "EMP-001",
+  "period": "2026-Q3"
+}
+```
 
 ---
 
@@ -44,11 +47,14 @@ Returned when the employee has sufficient approved data across all required cate
   - `strengths` (`array`): List of identified strengths grounded in evidence.
     - `title` (`string`): Strength title.
     - `description` (`string`): Detailed description of observed capability.
-    - `evidence` (`array[string]`): Contextual facts and metrics supporting the strength.
+    - `evidence` (`array[EvidenceItem]`): Grounded claims tied to approved source records:
+      - `source_type` (`string`): `"performance"` | `"goal"` | `"skill"` | `"task_outcome"` | `"evaluation_theme"`
+      - `source_id` (`integer`): ID of approved source record.
+      - `claim` (`string`): Factual, verified claim matching the source.
   - `development_areas` (`array`): Prioritized growth opportunities.
     - `title` (`string`): Development area title.
     - `description` (`string`): Specific growth gap.
-    - `evidence` (`array[string]`): Contextual metrics or feedback indicating the gap.
+    - `evidence` (`array[EvidenceItem]`): Grounded claims tied to approved source records.
     - `priority` (`string`): `"high"` | `"medium"` | `"low"`.
   - `development_plan` (`array`): Practical short-term improvement actions.
     - `action` (`string`): Practical action title.
@@ -74,10 +80,10 @@ Returned immediately if the employee profile is missing baseline data categories
 #### 3. Error Responses
 - **HTTP Status Code:** `502 Bad Gateway`
   - Triggered when Groq encounters network errors, timeouts, rate limits, or invalid model responses.
-  - Response body:
+  - Returns a client-safe response with a unique reference ID for log correlation:
     ```json
     {
-      "detail": "Groq API error encountered (RateLimitError). Unable to complete Career Coach generation."
+      "detail": "AI service temporarily unavailable. Reference ID: 7b845890-410a-4286-bc94-469b76c9ad24"
     }
     ```
   - *Safety Guarantee:* API keys, credentials, and internal stack traces are never leaked in error messages.
@@ -86,11 +92,16 @@ Returned immediately if the employee profile is missing baseline data categories
 
 ### Request & Response Examples
 
-#### Example 1: Request with Period
+#### Example 1: Primary Request Body
 ```http
-POST /api/career-coach/EMP-001?period=2026-Q3 HTTP/1.1
+POST /api/career-coach HTTP/1.1
 Host: localhost:8000
 Content-Type: application/json
+
+{
+  "employee_id": "EMP-001",
+  "period": "2026-Q3"
+}
 ```
 
 #### Example 1: Success Response
@@ -103,17 +114,23 @@ Content-Type: application/json
       "title": "High Performance Delivery",
       "description": "Consistently exceeds performance targets with top scores across key metrics.",
       "evidence": [
-        "Overall performance score of 93.5 in Q3 2026",
-        "Task completion rate of 96.0%",
-        "Goal achievement rate of 91.0%",
-        "Attendance rate of 99.0%"
+        {
+          "source_type": "performance",
+          "source_id": 1,
+          "claim": "Overall performance score of 93.5 in Q3 2026"
+        }
       ]
-    },
+    }
+  ],
     {
       "title": "Expertise in Python, FastAPI & Async Architecture",
       "description": "Demonstrates expert-level skill in modern backend technologies.",
       "evidence": [
-        "Architected core event-driven API gateway with 99.95% uptime"
+        {
+          "source_type": "skill",
+          "source_id": 2,
+          "claim": "Expert Python and FastAPI architectural skills"
+        }
       ]
     }
   ],
@@ -122,7 +139,11 @@ Content-Type: application/json
       "title": "Increase Knowledge Sharing Sessions",
       "description": "Conduct regular knowledge sharing to mentor junior peers.",
       "evidence": [
-        "Evaluation theme highlighted opportunity to run more knowledge sharing sessions for junior peers"
+        {
+          "source_type": "evaluation_theme",
+          "source_id": 1,
+          "claim": "Evaluation theme highlighted opportunity to mentor junior peers"
+        }
       ],
       "priority": "high"
     },
@@ -130,7 +151,11 @@ Content-Type: application/json
       "title": "Complete Redis Cluster Migration",
       "description": "Finalize migration of distributed caching to Redis Cluster.",
       "evidence": [
-        "Goal progress at 85% with deadline 2026-10-30"
+        {
+          "source_type": "goal",
+          "source_id": 1,
+          "claim": "Goal progress at 85% with deadline 2026-10-30"
+        }
       ],
       "priority": "medium"
     }
@@ -157,11 +182,15 @@ Content-Type: application/json
 }
 ```
 
-#### Example 2: Insufficient-Data Response
+#### Example 2: Insufficient-Data Request & Response
 ```http
-POST /api/career-coach/EMP-NEW HTTP/1.1
+POST /api/career-coach HTTP/1.1
 Host: localhost:8000
 Content-Type: application/json
+
+{
+  "employee_id": "EMP-NEW"
+}
 ```
 
 ```json
@@ -182,10 +211,179 @@ Content-Type: application/json
 
 ---
 
+## AI HR Policy Assistant API
+
+### Ask Policy Assistant
+
+Answers employee HR policy inquiries strictly based on approved active company policies and permitted employee profile facts. Supports persistent multi-turn conversations through conversation/session IDs.
+
+- **HTTP Method:** `POST`
+- **Path:** `/api/policy-assistant`
+- **Content-Type:** `application/json`
+
+### Request Body (`POST /api/policy-assistant`)
+
+| Field | Type | Required | Description | Example |
+| :--- | :--- | :--- | :--- | :--- |
+| `employee_id` | `string` | **Yes** | Unique identifier of the target employee | `"EMP-001"` |
+| `question` | `string` | **Yes** | Policy question to be answered | `"What is the annual leave rollover limit?"` |
+| `session_id` | `string` | No | Optional existing chat session ID. If omitted, a new persistent session is created. | `"8f3b2a4c-5678-4321-9876-abcdef012345"` |
+
+#### Example 1: Starting a New Session (Omit `session_id`)
+```http
+POST /api/policy-assistant HTTP/1.1
+Host: localhost:8000
+Content-Type: application/json
+
+{
+  "employee_id": "EMP-SEC-ALICE",
+  "question": "What is the annual leave rollover limit?"
+}
+```
+
+**Success Response (`200 OK`):**
+```json
+{
+  "status": "success",
+  "session_id": "8f3b2a4c-5678-4321-9876-abcdef012345",
+  "employee_id": "EMP-SEC-ALICE",
+  "answer": "Employees may carry forward up to five (5) unused annual leave days into the next calendar year.",
+  "policy_references": [
+    {
+      "policy_id": 1,
+      "policy_code": "POL-LEAVE-001",
+      "title": "Annual Leave & Time Off Policy",
+      "version": "1.0"
+    }
+  ],
+  "employee_facts_used": [],
+  "created_at": "2026-09-09T09:50:31Z"
+}
+```
+
+#### Example 2: Continuing an Existing Conversation (Provide `session_id`)
+```http
+POST /api/policy-assistant HTTP/1.1
+Host: localhost:8000
+Content-Type: application/json
+
+{
+  "employee_id": "EMP-SEC-ALICE",
+  "question": "What happens if I don't use them within the rollover period?",
+  "session_id": "8f3b2a4c-5678-4321-9876-abcdef012345"
+}
+```
+
+### Policy Assistant Error Handling
+- **`404 Not Found`**: Returned when the requested `session_id` does not exist.
+  ```json
+  { "detail": "Chat session not found." }
+  ```
+- **`403 Forbidden`**: Returned when an employee attempts to access a session belonging to another employee (strict tenant and identity isolation).
+  ```json
+  { "detail": "Access denied: session belongs to another employee." }
+  ```
+- **`502 Bad Gateway`**: Returned on transient or upstream AI provider errors without exposing internal database logs.
+
+### Hybrid Memory Architecture & Token Optimization
+The Policy Assistant incorporates a production-grade **Hybrid Memory Architecture** designed for bounded token usage, dialogue continuity, and long-term recall:
+- **Short-Term Memory (Budget Window)**: Replaces fixed message counts with a configurable character/token budget (`recent_messages_char_budget = 2500` chars). Greedily includes recent turns in `<RECENT_CONVERSATION_HISTORY>`.
+- **Rolling Conversation Summary**: When conversation history exceeds the budget, older turns are distilled into a compact summary stored in `ChatSession.summary` and injected as `<CONVERSATION_SUMMARY>`. Summaries update in batches rather than on every turn, with non-destructive fallback if summarization fails.
+- **Semantic Memory / Older Turn Retrieval**: Semantic retrieval uses subword vector embeddings and cosine similarity to retrieve relevant turns from older conversations (`<RELEVANT_CONVERSATION_MEMORIES>`) when an employee refers to topics discussed much earlier. Filtered by `similarity_threshold = 0.35` and bounded by `retrieved_memory_char_budget = 1500` chars.
+- **Strict Policy Authority**: Approved company policies (`<COMPANY_POLICIES>`) are the authoritative source of truth and **strictly supersede** any contradictory retrieved memory. Grounding verification ensures answers must cite active approved policies and cannot cite past conversation as policy evidence.
+- **Prompt-Injection Defense**: Delimiters in memories, summaries, and queries are neutralized through sanitization escaping.
+
+---
+
+## AI Evaluation Draft Assistant API
+
+### Generate Evaluation Draft
+
+Synthesizes approved employee records and optional manager observations into a structured, evidence-grounded performance evaluation draft.
+
+- **HTTP Method:** `POST`
+- **Path:** `/api/evaluation-draft`
+- **Content-Type:** `application/json`
+
+### Request Body (`POST /api/evaluation-draft`)
+
+| Field | Type | Required | Description | Example |
+| :--- | :--- | :--- | :--- | :--- |
+| `employee_id` | `string` | **Yes** | Unique identifier of the target employee | `"EMP-001"` |
+| `period` | `string` | **Yes** | Evaluation review cycle period | `"2026-Q3"` |
+| `evaluation_scores` | `object` | No | Optional dictionary of numeric metric scores (0.0 to 100.0) | `{"overall": 92.0}` |
+| `manager_notes` | `string` | No | Optional manager feedback or observations to integrate | `"Strong leadership on platform migration."` |
+
+Request payload example:
+```json
+{
+  "employee_id": "EMP-001",
+  "period": "2026-Q3",
+  "evaluation_scores": {
+    "overall": 92.0,
+    "leadership": 88.0
+  },
+  "manager_notes": "Demonstrated exceptional technical leadership during the platform migration."
+}
+```
+
+### Success Response (`200 OK`)
+```json
+{
+  "status": "success",
+  "employee_id": "EMP-001",
+  "period": "2026-Q3",
+  "evaluation_narrative": "Alice delivered exemplary technical performance during Q3 2026, achieving a 94.0 overall score and successfully guiding the core cutover without service disruption.",
+  "strengths": [
+    {
+      "title": "High Delivery Quality",
+      "description": "Consistently delivered robust systems with zero errors during production migration.",
+      "evidence": [
+        {
+          "source_type": "performance",
+          "source_id": 1,
+          "claim": "Achieved overall score of 94.0 and 97.0% task completion in Q3 2026"
+        }
+      ]
+    }
+  ],
+  "improvement_areas": [
+    {
+      "title": "Knowledge Sharing",
+      "description": "Conduct regular architecture walkthroughs for junior peers.",
+      "evidence": [
+        {
+          "source_type": "evaluation_theme",
+          "source_id": 1,
+          "claim": "Feedback highlighted opportunity to run more knowledge sharing sessions"
+        }
+      ],
+      "priority": "medium"
+    }
+  ],
+  "entered_scores": {
+    "overall": 92.0,
+    "leadership": 88.0
+  },
+  "human_review_required": true,
+  "review_disclaimer": "This evaluation is an AI-generated draft intended solely to assist manager review. A human manager must review, edit, and approve this evaluation before any official use or persistence.",
+  "created_at": "2026-09-14T11:00:00Z"
+}
+```
+
+### Governance & Safety Controls
+- **Stateless Draft Guarantee**: The service is strictly stateless; it never writes or auto-submits records to the database. Human manager review and approval is mandatory before any future persistence.
+- **Prohibited Decisions**: Deterministic filters block the AI from recommending or executing promotions, demotions, salary adjustments, bonuses, termination, or disciplinary actions.
+- **Approved Evidence Only**: Only records with `is_approved == True` are included in the AI context. Unapproved drafts and cross-employee records are excluded.
+- **Fail-Closed Insufficient Data**: If an employee lacks baseline data, an `insufficient_data` response is returned immediately with zero LLM token cost.
+
+---
+
 ## Development & Testing
 
 ### Running Tests
 All unit and integration tests can be executed via:
 ```powershell
-.venv\Scripts\pytest -v
+python -m pytest -v
 ```
+

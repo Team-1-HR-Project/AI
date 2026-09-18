@@ -1,4 +1,4 @@
-﻿"""Tests for the Policy Context Builder service (AI HR Policy Assistant Step 4)."""
+"""Tests for the Policy Context Builder service (AI HR Policy Assistant Step 4)."""
 
 from datetime import datetime, timezone
 
@@ -189,29 +189,72 @@ def test_non_existent_employee_handling(db_session, seed_test_data):
     assert context["employee_facts"] == {}
 
 
-# 6. Test category filtering
-def test_category_filtering(db_session, seed_test_data):
-    # Search within 'Workplace Guidelines' category
+# 6. Test category relevance boost behavior
+def test_category_boost_correct_category(db_session, seed_test_data):
+    """When category matches, policy receives boost and is retrieved as top candidate."""
     context = PolicyContextBuilder.build_context(
         db=db_session,
         employee_id="EMP-ALICE",
-        question="How many days can I work?",
+        question="Can I work remotely, and what are the requirements?",
         category="Workplace Guidelines",
     )
 
     assert context["has_matching_policies"] is True
-    for p in context["matched_policies"]:
-        assert "workplace guidelines" in p["category"].lower()
+    matched_codes = [p["policy_code"] for p in context["matched_policies"]]
+    assert "POL-REMOTE-001" in matched_codes
+    assert matched_codes[0] == "POL-REMOTE-001"
 
-    # Search within non-existent category
-    context_empty = PolicyContextBuilder.build_context(
+
+def test_category_boost_wrong_but_related_category(db_session, seed_test_data):
+    """When category differs/is adjacent, a highly relevant policy MUST STILL be retrieved."""
+    context = PolicyContextBuilder.build_context(
         db=db_session,
         employee_id="EMP-ALICE",
-        question="How many days can I work?",
-        category="NonExistentCategory",
+        question="Can I work remotely, and what are the requirements?",
+        category="Workplace & Attendance",
     )
-    assert context_empty["has_matching_policies"] is False
-    assert "No approved active policies found matching category" in context_empty["unsupported_reason"]
+
+    assert context["has_matching_policies"] is True
+    matched_codes = [p["policy_code"] for p in context["matched_policies"]]
+    # POL-REMOTE-001 is in Workplace Guidelines, but MUST STILL be retrievable
+    assert "POL-REMOTE-001" in matched_codes
+
+
+def test_category_boost_none_category(db_session, seed_test_data):
+    """When category is None, lexical relevance scoring correctly retrieves the policy."""
+    context = PolicyContextBuilder.build_context(
+        db=db_session,
+        employee_id="EMP-ALICE",
+        question="Can I work remotely, and what are the requirements?",
+        category=None,
+    )
+
+    assert context["has_matching_policies"] is True
+    matched_codes = [p["policy_code"] for p in context["matched_policies"]]
+    assert "POL-REMOTE-001" in matched_codes
+    assert matched_codes[0] == "POL-REMOTE-001"
+
+
+def test_category_boost_scoring_bonus(db_session, seed_test_data):
+    """Verify category provides +10 relevance boost without hard SQL exclusion."""
+    # With category=None, conduct policy does not get bonus
+    ctx_no_cat = PolicyContextBuilder.build_context(
+        db=db_session,
+        employee_id="EMP-ALICE",
+        question="ethics and workplace respect rules",
+        category=None,
+    )
+    # With category matching Code of Conduct, conduct policy gets boosted
+    ctx_with_cat = PolicyContextBuilder.build_context(
+        db=db_session,
+        employee_id="EMP-ALICE",
+        question="ethics and workplace respect rules",
+        category="Code of Conduct",
+    )
+
+    assert "POL-CONDUCT-001" in [p["policy_code"] for p in ctx_no_cat["matched_policies"]]
+    assert "POL-CONDUCT-001" in [p["policy_code"] for p in ctx_with_cat["matched_policies"]]
+    assert ctx_with_cat["matched_policies"][0]["policy_code"] == "POL-CONDUCT-001"
 
 
 # 7. Test unsupported / no-matching-policy behavior
