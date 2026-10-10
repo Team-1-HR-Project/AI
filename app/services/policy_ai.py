@@ -7,25 +7,32 @@ grounding verification against approved policy sources, and structured response 
 import json
 import logging
 import os
-import random
 import re
 import time
 import uuid
 from typing import Any
 
 from groq import (
-    APIConnectionError,
     APIError,
-    APITimeoutError,
-    AuthenticationError,
-    BadRequestError,
     Groq,
-    RateLimitError,
 )
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.core.groq_provider import (
+    DEFAULT_DEADLINE_SECONDS,
+    DEFAULT_TIMEOUT_SECONDS,
+    MAX_RETRIES,
+    GroqClientError,
+    GroqConfigurationError,
+    GroqDeadlineExceededError,
+    GroqEmptyResponseError,
+    GroqProviderError,
+    create_groq_client,
+    execute_chat_completion,
+    resolve_groq_config,
+)
 from app.models import ChatMessage, ChatSession, CompanyPolicy, Employee
 from app.schemas.policy_assistant import (
     PolicyAIModelFallbackOutput,
@@ -36,16 +43,15 @@ from app.schemas.policy_assistant import (
     PolicyFallbackResponse,
     utc_now,
 )
+from app.services.grounding import (
+    extract_business_metrics_from_text,
+    validate_numeric_grounding,
+)
 from app.services.memory_service import BaseMemoryManager, MemoryManager
 from app.services.policy_context import PolicyContextBuilder
+from app.services.shared_hr_data import get_shared_employee, is_shared_hr_schema
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
-DEFAULT_TIMEOUT_SECONDS = 30.0
-DEFAULT_DEADLINE_SECONDS = 25.0
-MAX_RETRIES = 2
-INITIAL_BACKOFF_SECONDS = 0.5
 
 PROHIBITED_POLICY_PATTERNS = [
     re.compile(r"\b(hereby approved|i approve your (leave|request|raise|promotion)|you are (promoted|terminated|fired|hired))\b", re.IGNORECASE),
@@ -171,16 +177,8 @@ Do NOT include employee_id or created_at in the output. Do NOT wrap output in ma
 
 
 def _extract_numbers_from_text(text: str) -> list[float]:
-    """Extracts numeric values (integers, floats, percentages) from a text string."""
-    cleaned = re.sub(r"\b\d{4}-Q[1-4]\b", " ", text, flags=re.IGNORECASE)
-    tokens = re.findall(r"(?<![a-zA-Z_])[-+]?(?:\d*\.\d+|\d+)(?![a-zA-Z_])", cleaned)
-    nums: list[float] = []
-    for t in tokens:
-        try:
-            nums.append(float(t))
-        except ValueError:
-            pass
-    return nums
+    """Extracts numeric values (integers, floats, percentages) from a text string while ignoring IDs and periods."""
+    return extract_business_metrics_from_text(text)
 
 
 def _extract_policy_numbers(policy_meta: dict[str, Any]) -> set[float]:
@@ -211,6 +209,10 @@ def _extract_tokens(text: str) -> set[str]:
 
 class PolicyAIServiceError(Exception):
     """Application-level exception for AI Policy Assistant service errors."""
+
+
+class PolicyDependencyError(PolicyAIServiceError):
+    """Raised when policy storage or another non-provider dependency fails."""
 
 
 class PolicyGroundingError(PolicyAIServiceError):
@@ -253,19 +255,24 @@ class PolicyAIService:
         max_retries: int = MAX_RETRIES,
         memory_manager: BaseMemoryManager | None = None,
     ):
-        self.api_key = api_key or os.getenv("GROQ_API_KEY")
+        try:
+            config = resolve_groq_config(
+                api_key=api_key,
+                model=model,
+                base_url=base_url,
+                timeout=timeout,
+                max_retries=max_retries,
+            )
+        except GroqConfigurationError as exc:
+            raise PolicyAIServiceError(str(exc)) from exc
 
-        if model is not None:
-            configured_model = model
-        else:
-            configured_model = os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL)
-        if not configured_model or not isinstance(configured_model, str) or not configured_model.strip():
-            raise PolicyAIServiceError("GROQ_MODEL configuration is missing or invalid.")
-        self.model = configured_model.strip()
-
-        self.base_url = base_url or os.getenv("GROQ_BASE_URL", "https://api.groq.com")
-        self.timeout = float(os.getenv("GROQ_TIMEOUT_SECONDS", str(timeout)))
-        self.max_retries = max_retries
+        self.config = config
+        self.api_key = config.api_key
+        self.model = config.model
+        self.base_url = config.base_url
+        self.timeout = config.timeout
+        self.deadline = config.deadline
+        self.max_retries = config.max_retries
         self._client = client
         self.memory_manager = memory_manager or MemoryManager()
 
@@ -276,7 +283,15 @@ class PolicyAIService:
             raise PolicyAIServiceError(
                 "GROQ_API_KEY is not configured. Please set the GROQ_API_KEY environment variable."
             )
-        return Groq(api_key=self.api_key, base_url=self.base_url, timeout=self.timeout)
+        try:
+            return create_groq_client(
+                config=self.config,
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=self.timeout,
+            )
+        except GroqConfigurationError as exc:
+            raise PolicyAIServiceError(str(exc)) from exc
 
     def _validate_policy_grounding(
         self,
@@ -370,16 +385,16 @@ class PolicyAIService:
                 elif isinstance(v, str):
                     allowed_nums.update(_extract_numbers_from_text(v))
 
-        for num in answer_nums:
-            matched = any(abs(num - allowed_num) < 1e-4 for allowed_num in allowed_nums)
-            if not matched:
-                logger.warning(
-                    "Policy answer rejected: numeric value %s in answer is not supported by referenced policies or employee facts.",
-                    num,
-                )
-                raise PolicyGroundingError(
-                    f"Policy grounding failure: numeric value '{num}' in answer is not supported by referenced policies."
-                )
+        is_valid, ungrounded = validate_numeric_grounding(answer_nums, allowed_nums, tolerance=1e-4)
+        if not is_valid:
+            num = ungrounded[0]
+            logger.warning(
+                "Policy answer rejected: numeric value %s in answer is not supported by referenced policies or employee facts.",
+                num,
+            )
+            raise PolicyGroundingError(
+                f"Policy grounding failure: numeric value '{num}' in answer is not supported by referenced policies."
+            )
 
         # 4 & 5. Semantic overlap and cross-policy verification
         answer_tokens = _extract_tokens(output.answer)
@@ -496,95 +511,44 @@ class PolicyAIService:
         system_prompt: str = POLICY_AI_SYSTEM_PROMPT,
         deadline: float | None = None,
     ) -> str:
-        """Calls Groq API with bounded exponential backoff retries and deadline enforcement for transient failures."""
+        """Calls Groq API with bounded retries, jitter, and deadline enforcement."""
         client = self._get_client()
-        attempts = 1 + self.max_retries
-        last_exception = None
-
-        for attempt in range(attempts):
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise PolicyAIServiceError("AI request deadline exceeded. Service temporarily unavailable.")
-                effective_timeout = min(self.timeout, max(0.5, remaining))
-            else:
-                effective_timeout = self.timeout
-
-            try:
-                response = client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=0.1,
-                    response_format={"type": "json_object"},
-                    timeout=effective_timeout,
-                )
-                raw_content = response.choices[0].message.content
-                if not raw_content:
-                    raise PolicyAIServiceError("Groq returned an empty response.")
-                return raw_content
-
-            except (RateLimitError, APIConnectionError, APITimeoutError) as e:
-                last_exception = e
-                error_type = type(e).__name__
-                logger.warning(
-                    "Transient Groq error (%s) on attempt %d/%d.",
-                    error_type,
-                    attempt + 1,
-                    attempts,
-                )
-                if attempt < self.max_retries:
-                    jitter = 0.8 + 0.4 * random.random()
-                    backoff = INITIAL_BACKOFF_SECONDS * (2**attempt) * jitter
-                    if deadline is not None and (time.monotonic() + backoff >= deadline):
-                        raise PolicyAIServiceError(
-                            "AI request deadline exceeded during retry backoff. Service temporarily unavailable."
-                        ) from None
-                    time.sleep(backoff)
-                    continue
-
-                if isinstance(e, RateLimitError):
-                    raise PolicyAIServiceError(
-                        "Provider rate limit reached. Service temporarily unavailable."
-                    ) from None
-                if isinstance(e, APITimeoutError):
-                    raise PolicyAIServiceError(
-                        "Provider connection timeout. Service temporarily unavailable."
-                    ) from None
-                raise PolicyAIServiceError(
-                    f"Provider connection error ({error_type}). Service temporarily unavailable."
-                ) from None
-
-            except APIError as e:
-                status_code = getattr(e, "status_code", None)
-                if status_code and status_code in (500, 502, 503, 504) and attempt < self.max_retries:
-                    last_exception = e
-                    jitter = 0.8 + 0.4 * random.random()
-                    backoff = INITIAL_BACKOFF_SECONDS * (2**attempt) * jitter
-                    if deadline is not None and (time.monotonic() + backoff >= deadline):
-                        raise PolicyAIServiceError(
-                            "AI request deadline exceeded during retry backoff. Service temporarily unavailable."
-                        ) from None
-                    time.sleep(backoff)
-                    continue
-                raise PolicyAIServiceError(
-                    f"Groq API error encountered ({type(e).__name__}). Unable to complete policy answer."
-                ) from None
-
-            except (AuthenticationError, BadRequestError) as e:
-                raise PolicyAIServiceError(
-                    f"Groq request configuration error ({type(e).__name__})."
-                ) from None
-
-        raise PolicyAIServiceError(
-            f"Groq provider temporarily unavailable after retries: {type(last_exception).__name__}"
-        ) from None
+        try:
+            return execute_chat_completion(
+                client=client,
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.1 if system_prompt == POLICY_AI_SYSTEM_PROMPT else 0.0,
+                response_format={"type": "json_object"},
+                timeout=self.timeout,
+                deadline=deadline,
+                max_retries=self.max_retries,
+                error_label="AI provider",
+            )
+        except GroqDeadlineExceededError as exc:
+            raise PolicyAIServiceError("AI request deadline exceeded. Service temporarily unavailable.") from exc
+        except GroqClientError as exc:
+            raise PolicyAIServiceError("Groq request configuration error.") from exc
+        except GroqEmptyResponseError as exc:
+            raise PolicyAIServiceError("Groq returned an empty response.") from exc
+        except GroqProviderError as exc:
+            raise PolicyAIServiceError(str(exc)) from exc
 
     @staticmethod
     def get_available_categories(db: Session) -> list[str]:
         """Retrieves distinct categories from active and approved company policies."""
+        if is_shared_hr_schema(db.get_bind()):
+            # The Laravel schema has no policy category column.  PolicyContextBuilder
+            # deliberately exposes the single schema-backed category "general".
+            from sqlalchemy import text
+
+            exists = db.execute(
+                text("SELECT 1 FROM policies AS p INNER JOIN policy_versions AS pv ON pv.policy_id = p.id WHERE p.status = 'active' AND pv.status = 'active' LIMIT 1")
+            ).first()
+            return ["general"] if exists else []
         records = (
             db.query(CompanyPolicy.category)
             .filter(CompanyPolicy.is_active.is_(True), CompanyPolicy.is_approved.is_(True))
@@ -683,13 +647,19 @@ class PolicyAIService:
                 return session
 
             # Verify employee exists before creating a session to prevent foreign key errors
-            employee = db.query(Employee).filter(Employee.id == employee_id).first()
+            employee = (
+                get_shared_employee(db, employee_id)
+                if is_shared_hr_schema(db.get_bind())
+                else db.query(Employee).filter(Employee.id == employee_id).first()
+            )
             if not employee:
                 return None
 
+            canonical_employee_id = employee.id
+
             new_session = ChatSession(
                 id=str(uuid.uuid4()),
-                employee_id=employee_id,
+                employee_id=canonical_employee_id,
                 title=None,
                 summary=None,
                 created_at=utc_now(),
@@ -704,7 +674,7 @@ class PolicyAIService:
         except SQLAlchemyError:
             db.rollback()
             logger.exception("Database error while resolving chat session.")
-            raise PolicyAIServiceError("Database operation failed while resolving chat session.") from None
+            raise PolicyDependencyError("Database operation failed while resolving chat session.") from None
 
     def record_chat_message(
         self,
@@ -739,7 +709,7 @@ class PolicyAIService:
         except SQLAlchemyError:
             db.rollback()
             logger.exception("Database error while recording chat message.")
-            raise PolicyAIServiceError("Database operation failed while persisting chat message.") from None
+            raise PolicyDependencyError("Database operation failed while persisting chat message.") from None
 
     def record_chat_turn(
         self,
@@ -792,25 +762,11 @@ class PolicyAIService:
             db.commit()
             db.refresh(user_msg)
             db.refresh(asst_msg)
-
-            # Optional notification for memory managers (e.g. Mem0)
-            if hasattr(self.memory_manager, "on_chat_turn_recorded"):
-                try:
-                    emp_id = session.employee_id if session else None
-                    self.memory_manager.on_chat_turn_recorded(
-                        session_id=session_id,
-                        employee_id=emp_id,
-                        user_content=user_content,
-                        assistant_content=assistant_content,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Memory manager on_chat_turn_recorded hook failed: %s", exc)
-
             return user_msg, asst_msg
         except SQLAlchemyError:
             db.rollback()
             logger.exception("Database error while recording chat turn.")
-            raise PolicyAIServiceError("Database operation failed while persisting chat turn.") from None
+            raise PolicyDependencyError("Database operation failed while persisting chat turn.") from None
 
 
     def generate_conversation_summary(

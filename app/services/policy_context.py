@@ -8,9 +8,11 @@ isolation, approved-data enforcement, and deterministic relevance filtering.
 import re
 from typing import Any
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.models import CompanyPolicy, Employee
+from app.services.shared_hr_data import get_shared_employee, is_shared_hr_schema
 
 # Context Limits
 MAX_MATCHED_POLICIES = 3
@@ -75,6 +77,71 @@ class PolicyContextBuilder:
             grounding metadata, and sufficiency/unsupported status.
         """
         # 1. Retrieve permitted employee facts (Strict Employee Isolation)
+        if is_shared_hr_schema(db.get_bind()):
+            employee = get_shared_employee(db, employee_id)
+            if not employee:
+                return {
+                    "has_matching_policies": False,
+                    "unsupported_reason": f"Employee with id '{employee_id}' was not found in the system.",
+                    "employee_id": employee_id,
+                    "employee_found": False,
+                    "employee_facts": {},
+                    "matched_policies": [],
+                    "approved_policy_sources": {},
+                    "approved_policy_codes": {},
+                    "total_policies_matched": 0,
+                }
+
+            employee_facts = {
+                "employee_id": employee.id,
+                "role_title": _clean_str(employee.role_title, 100),
+                "department": _clean_str(employee.department, 100),
+            }
+            policies = db.execute(text("""
+                SELECT p.id, p.title, p.description, p.status, pv.version, pv.content
+                FROM policies AS p
+                INNER JOIN policy_versions AS pv ON pv.policy_id = p.id
+                WHERE p.status = 'active' AND pv.status = 'active'
+                  AND pv.id = (
+                    SELECT MAX(pv2.id) FROM policy_versions AS pv2
+                    WHERE pv2.policy_id = p.id AND pv2.status = 'active'
+                  )
+                ORDER BY p.id
+            """)).mappings().all()
+            question_keywords = _extract_keywords(question)
+            scored: list[tuple[int, dict[str, Any]]] = []
+            for row in policies:
+                record = {
+                    "id": int(row["id"]),
+                    "policy_code": f"POLICY-{row['id']}",
+                    "title": _clean_str(row["title"], 255),
+                    "category": "general",
+                    "version": str(row["version"]),
+                    "summary": _clean_str(row["description"], MAX_POLICY_SUMMARY_CHARS),
+                    "content": _clean_str(row["content"], MAX_POLICY_CONTENT_CHARS),
+                }
+                words = _extract_keywords(" ".join(str(value) for value in record.values()))
+                score = len(question_keywords & words)
+                if record["title"].lower() in question.lower():
+                    score += 10
+                if category and category.strip().lower() == "general":
+                    score += 10
+                if score > 0:
+                    scored.append((score, record))
+            scored.sort(key=lambda item: (-item[0], item[1]["policy_code"]))
+            matched = [record for _, record in scored[:MAX_MATCHED_POLICIES]]
+            return {
+                "has_matching_policies": bool(matched),
+                "unsupported_reason": None if matched else "No active company policies address the subject of this inquiry.",
+                "employee_id": employee.id,
+                "employee_found": True,
+                "employee_facts": employee_facts,
+                "matched_policies": matched,
+                "approved_policy_sources": {record["id"]: record for record in matched},
+                "approved_policy_codes": {record["policy_code"]: record["id"] for record in matched},
+                "total_policies_matched": len(matched),
+            }
+
         employee = db.query(Employee).filter(Employee.id == employee_id).first()
         if not employee:
             return {

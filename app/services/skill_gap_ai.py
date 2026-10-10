@@ -10,24 +10,29 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import random
 import re
 import time
 from typing import Any
 
 from groq import (
-    APIConnectionError,
-    APIError,
-    APITimeoutError,
-    AuthenticationError,
-    BadRequestError,
     Groq,
-    RateLimitError,
 )
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
+from app.core.groq_provider import (
+    DEFAULT_DEADLINE_SECONDS,
+    DEFAULT_TIMEOUT_SECONDS,
+    MAX_RETRIES,
+    GroqClientError,
+    GroqConfigurationError,
+    GroqDeadlineExceededError,
+    GroqEmptyResponseError,
+    GroqProviderError,
+    create_groq_client,
+    execute_chat_completion,
+    resolve_groq_config,
+)
 from app.schemas.career_coach import EvidenceItem
 from app.schemas.skill_gap import (
     SkillGapInsufficientDataResponse,
@@ -36,15 +41,14 @@ from app.schemas.skill_gap import (
     SkillGapSuccessResponse,
     utc_now,
 )
+from app.services.grounding import (
+    extract_business_metrics_from_text,
+    get_allowed_numeric_set,
+    validate_numeric_grounding,
+)
 from app.services.skill_gap_context import SkillGapContextBuilder
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
-DEFAULT_TIMEOUT_SECONDS = 30.0
-DEFAULT_DEADLINE_SECONDS = 25.0
-MAX_RETRIES = 2
-INITIAL_BACKOFF_SECONDS = 0.5
 
 # Prohibited Employment Decisions & Compensation Keywords
 PROHIBITED_PATTERNS = [
@@ -134,37 +138,14 @@ class SkillGapAIServiceError(Exception):
 def _extract_numbers_from_text(text: str) -> list[float]:
     """Extracts numeric values (integers, floats, percentages) from text.
 
-    Ignores calendar years, quarter/year references (e.g., 'Q3 2026', 'Q4 2026',
-    '2026-Q3'), and standard date formats so they are not treated as performance metrics.
+    Ignores calendar years, quarter/year references, IDs, and standard date formats.
     """
-    cleaned = re.sub(r"\b\d{4}[-_/ ]?Q[1-4]\b", " ", text, flags=re.IGNORECASE)
-    cleaned = re.sub(
-        r"\bQ[1-4](?:[-_/ ]|\s+of\s+)?\d{4}\b", " ", cleaned, flags=re.IGNORECASE
-    )
-    cleaned = re.sub(r"\b\d{4}[-/]\d{1,2}(?:[-/]\d{1,2})?\b", " ", cleaned)
-    cleaned = re.sub(r"\b(?:19|20)\d{2}\b", " ", cleaned)
-    tokens = re.findall(r"(?<![a-zA-Z_])[-+]?(?:\d*\.\d+|\d+)(?![a-zA-Z_])", cleaned)
-    nums: list[float] = []
-    for t in tokens:
-        try:
-            nums.append(float(t))
-        except ValueError:
-            pass
-    return nums
+    return extract_business_metrics_from_text(text)
 
 
 def _extract_source_numbers(source_data: dict[str, Any]) -> set[float]:
     """Extracts all canonical numerical values present in the source record."""
-    source_nums: set[float] = set()
-    for k, v in source_data.items():
-        if k in ("id", "employee_id"):
-            continue
-        if isinstance(v, (int, float)):
-            source_nums.add(float(v))
-        elif isinstance(v, str):
-            extracted = _extract_numbers_from_text(v)
-            source_nums.update(extracted)
-    return source_nums
+    return get_allowed_numeric_set(source_data)
 
 
 def _extract_tokens(text: str) -> set[str]:
@@ -199,14 +180,24 @@ class SkillGapAIService:
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         max_retries: int = MAX_RETRIES,
     ) -> None:
-        self.api_key = api_key or os.getenv("GROQ_API_KEY")
-        configured_model = model or os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL)
-        if not configured_model or not isinstance(configured_model, str) or not configured_model.strip():
-            raise SkillGapAIServiceError("GROQ_MODEL configuration is missing or invalid.")
-        self.model = configured_model.strip()
-        self.base_url = base_url or os.getenv("GROQ_BASE_URL", "https://api.groq.com")
-        self.timeout = float(os.getenv("GROQ_TIMEOUT_SECONDS", str(timeout)))
-        self.max_retries = max_retries
+        try:
+            config = resolve_groq_config(
+                api_key=api_key,
+                model=model,
+                base_url=base_url,
+                timeout=timeout,
+                max_retries=max_retries,
+            )
+        except GroqConfigurationError as exc:
+            raise SkillGapAIServiceError(str(exc)) from exc
+
+        self.config = config
+        self.api_key = config.api_key
+        self.model = config.model
+        self.base_url = config.base_url
+        self.timeout = config.timeout
+        self.deadline = config.deadline
+        self.max_retries = config.max_retries
         self._client = client
 
     def _get_client(self) -> Groq:
@@ -216,7 +207,15 @@ class SkillGapAIService:
             raise SkillGapAIServiceError(
                 "GROQ_API_KEY is not configured. Please set the GROQ_API_KEY environment variable."
             )
-        return Groq(api_key=self.api_key, base_url=self.base_url, timeout=self.timeout)
+        try:
+            return create_groq_client(
+                config=self.config,
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=self.timeout,
+            )
+        except GroqConfigurationError as exc:
+            raise SkillGapAIServiceError(str(exc)) from exc
 
     def _validate_safety_policy(self, output: SkillGapModelOutput) -> None:
         """Deterministic application-level output safety policy.
@@ -302,18 +301,18 @@ class SkillGapAIService:
             claim_nums = _extract_numbers_from_text(ev.claim)
             source_nums = _extract_source_numbers(source_data)
 
-            for c_num in claim_nums:
-                matched = any(abs(c_num - s_num) < 1e-4 for s_num in source_nums)
-                if not matched:
-                    logger.warning(
-                        "Skill gap output rejected: numeric claim %s in evidence does not match source data (%s, %s).",
-                        c_num,
-                        ev.source_type,
-                        ev.source_id,
-                    )
-                    raise SkillGapAIServiceError(
-                        f"Evidence grounding failure: numeric value '{c_num}' in claim '{ev.claim}' does not match source record ('{ev.source_type}', {ev.source_id})."
-                    )
+            is_valid, ungrounded = validate_numeric_grounding(claim_nums, source_nums, tolerance=1e-4)
+            if not is_valid:
+                c_num = ungrounded[0]
+                logger.warning(
+                    "Skill gap output rejected: numeric claim %s in evidence does not match source data (%s, %s).",
+                    c_num,
+                    ev.source_type,
+                    ev.source_id,
+                )
+                raise SkillGapAIServiceError(
+                    f"Evidence grounding failure: numeric value '{c_num}' in claim '{ev.claim}' does not match source record ('{ev.source_type}', {ev.source_id})."
+                )
 
             # Fact grounding semantic overlap
             source_text_parts = [
@@ -349,95 +348,33 @@ class SkillGapAIService:
     ) -> str:
         """Invokes Groq with exponential backoff retries and deadline enforcement."""
         client = self._get_client()
-        attempts = self.max_retries + 1
-        last_exception: Exception | None = None
-
-        for attempt in range(attempts):
-            if deadline is not None and time.monotonic() >= deadline:
-                raise SkillGapAIServiceError(
-                    "AI request deadline exceeded before provider invocation. Service temporarily unavailable."
-                )
-
-            effective_timeout = self.timeout
-            if deadline is not None:
-                remaining_time = deadline - time.monotonic()
-                if remaining_time <= 0:
-                    raise SkillGapAIServiceError(
-                        "AI request deadline exceeded. Service temporarily unavailable."
-                    )
-                effective_timeout = min(self.timeout, remaining_time)
-
-            try:
-                response = client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": GROQ_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=0.2,
-                    response_format={"type": "json_object"},
-                    timeout=effective_timeout,
-                )
-                raw_content = response.choices[0].message.content
-                if not raw_content:
-                    raise SkillGapAIServiceError("Groq returned an empty response.")
-                return raw_content
-
-            except (RateLimitError, APIConnectionError, APITimeoutError) as e:
-                last_exception = e
-                error_type = type(e).__name__
-                logger.warning(
-                    "Transient Groq error (%s) on attempt %d/%d.",
-                    error_type,
-                    attempt + 1,
-                    attempts,
-                )
-                if attempt < self.max_retries:
-                    jitter = 0.8 + 0.4 * random.random()
-                    backoff = INITIAL_BACKOFF_SECONDS * (2**attempt) * jitter
-                    if deadline is not None and (time.monotonic() + backoff >= deadline):
-                        raise SkillGapAIServiceError(
-                            "AI request deadline exceeded during retry backoff. Service temporarily unavailable."
-                        ) from None
-                    time.sleep(backoff)
-                    continue
-
-                if isinstance(e, RateLimitError):
-                    raise SkillGapAIServiceError(
-                        "Provider rate limit reached. Service temporarily unavailable."
-                    ) from None
-                if isinstance(e, APITimeoutError):
-                    raise SkillGapAIServiceError(
-                        "Provider connection timeout. Service temporarily unavailable."
-                    ) from None
-                raise SkillGapAIServiceError(
-                    f"Provider connection error ({error_type}). Service temporarily unavailable."
-                ) from None
-
-            except APIError as e:
-                status_code = getattr(e, "status_code", None)
-                if status_code and status_code in (500, 502, 503, 504) and attempt < self.max_retries:
-                    last_exception = e
-                    jitter = 0.8 + 0.4 * random.random()
-                    backoff = INITIAL_BACKOFF_SECONDS * (2**attempt) * jitter
-                    if deadline is not None and (time.monotonic() + backoff >= deadline):
-                        raise SkillGapAIServiceError(
-                            "AI request deadline exceeded during retry backoff. Service temporarily unavailable."
-                        ) from None
-                    time.sleep(backoff)
-                    continue
-                raise SkillGapAIServiceError(
-                    f"Groq API error encountered ({type(e).__name__}). Unable to complete Skill Gap generation."
-                ) from None
-
-            except (AuthenticationError, BadRequestError) as e:
-                raise SkillGapAIServiceError(
-                    f"Groq request configuration error ({type(e).__name__})."
-                ) from None
-
-        raise SkillGapAIServiceError(
-            f"Groq provider temporarily unavailable after retries: {type(last_exception).__name__}"
-        ) from None
+        try:
+            return execute_chat_completion(
+                client=client,
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": GROQ_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.2,
+                response_format={"type": "json_object"},
+                timeout=self.timeout,
+                deadline=deadline,
+                max_retries=self.max_retries,
+                error_label="AI provider",
+            )
+        except GroqDeadlineExceededError as exc:
+            raise SkillGapAIServiceError(
+                "AI request deadline exceeded. Service temporarily unavailable."
+            ) from exc
+        except GroqClientError as exc:
+            raise SkillGapAIServiceError(
+                "AI provider configuration or request formatting error."
+            ) from exc
+        except GroqEmptyResponseError as exc:
+            raise SkillGapAIServiceError("Groq returned an empty response.") from exc
+        except GroqProviderError as exc:
+            raise SkillGapAIServiceError(str(exc)) from exc
 
     def generate_skill_gap_analysis(
         self,

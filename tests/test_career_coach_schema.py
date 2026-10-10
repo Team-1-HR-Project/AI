@@ -61,6 +61,7 @@ def test_valid_career_coach_response():
     model = CareerCoachSuccessResponse.model_validate(VALID_SUCCESS_DATA)
     assert model.status == "success"
     assert model.employee_id == "EMP-001"
+    assert model.development_focus is None
     assert len(model.strengths) == 1
     assert model.strengths[0].evidence[0].source_type == "performance"
     assert model.strengths[0].evidence[0].source_id == 1
@@ -250,4 +251,3 @@ def test_career_coach_request_rejects_extra_fields():
             unexpected_field="disallowed",
         )
     assert "extra_forbidden" in str(exc.value) or "unexpected_field" in str(exc.value)
-

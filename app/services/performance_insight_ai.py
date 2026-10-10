@@ -9,24 +9,27 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import random
 import re
-import time
 from typing import Any
 
 from groq import (
-    APIConnectionError,
-    APIError,
-    APITimeoutError,
-    AuthenticationError,
-    BadRequestError,
     Groq,
-    RateLimitError,
 )
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
+from app.core.groq_provider import (
+    DEFAULT_TIMEOUT_SECONDS,
+    MAX_RETRIES,
+    GroqClientError,
+    GroqConfigurationError,
+    GroqDeadlineExceededError,
+    GroqEmptyResponseError,
+    GroqProviderError,
+    create_groq_client,
+    execute_chat_completion,
+    resolve_groq_config,
+)
 from app.schemas.performance_insight import (
     AIInterpretation,
     CalculatedTrends,
@@ -40,18 +43,18 @@ from app.schemas.performance_insight import (
     VerifiedFacts,
     utc_now,
 )
+from app.services.grounding import (
+    extract_business_metrics_from_text,
+    extract_grounded_facts_from_context,
+    get_allowed_numeric_set,
+    validate_numeric_grounding,
+)
 from app.services.performance_insight_context import (
     METRIC_FIELDS,
     PerformanceInsightContextBuilder,
 )
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
-DEFAULT_TIMEOUT_SECONDS = 30.0
-DEFAULT_DEADLINE_SECONDS = 25.0
-MAX_RETRIES = 2
-INITIAL_BACKOFF_SECONDS = 0.5
 
 CANONICAL_METRICS = set(METRIC_FIELDS)
 
@@ -162,18 +165,9 @@ def _sanitize_untrusted_prompt_text(text: str) -> str:
 def _extract_numbers_from_text(text: str) -> list[float]:
     """Extracts numeric values (integers, floats, percentages) from a text string.
 
-    Ignores dates/periods formatted like 2026-Q3 and standalone 4-digit years.
+    Ignores dates/periods formatted like 2026-Q3, standalone years, quarters, and IDs.
     """
-    cleaned = re.sub(r"\b\d{4}-Q[1-4]\b", " ", text, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b\d{4}\b", " ", cleaned)
-    tokens = re.findall(r"(?<![a-zA-Z_])[-+]?(?:\d*\.\d+|\d+)(?![a-zA-Z_])", cleaned)
-    nums: list[float] = []
-    for t in tokens:
-        try:
-            nums.append(float(t))
-        except ValueError:
-            pass
-    return nums
+    return extract_business_metrics_from_text(text)
 
 
 def _extract_periods_from_text(text: str) -> set[str]:
@@ -184,29 +178,8 @@ def _extract_periods_from_text(text: str) -> set[str]:
 
 def _extract_context_numbers(context: dict[str, Any]) -> set[float]:
     """Extracts all valid numerical values present in the context metrics and trends."""
-    nums: set[float] = set()
-    # From factual metrics
-    for m in context.get("facts", {}).get("metrics_by_period", []):
-        for k, v in m.items():
-            if k in ("period", "id", "employee_id"):
-                continue
-            if isinstance(v, (int, float)):
-                nums.add(round(float(v), 2))
-                nums.add(round(float(v), 1))
-                nums.add(float(int(v)))
-
-    # From calculated trends
-    for t_data in context.get("calculated_trends", {}).get("metric_trends", {}).values():
-        for k in ("previous_value", "current_value", "delta", "percent_change"):
-            v = t_data.get(k)
-            if isinstance(v, (int, float)):
-                nums.add(round(float(v), 2))
-                nums.add(round(float(v), 1))
-                nums.add(float(int(v)))
-                nums.add(round(abs(float(v)), 2))
-                nums.add(round(abs(float(v)), 1))
-                nums.add(float(int(abs(v))))
-    return nums
+    facts = extract_grounded_facts_from_context(context)
+    return get_allowed_numeric_set(facts)
 
 
 class PerformanceInsightAIServiceError(Exception):
@@ -225,19 +198,24 @@ class PerformanceInsightAIService:
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         max_retries: int = MAX_RETRIES,
     ):
-        self.api_key = api_key or os.getenv("GROQ_API_KEY")
+        try:
+            config = resolve_groq_config(
+                api_key=api_key,
+                model=model,
+                base_url=base_url,
+                timeout=timeout,
+                max_retries=max_retries,
+            )
+        except GroqConfigurationError as exc:
+            raise PerformanceInsightAIServiceError(str(exc)) from exc
 
-        if model is not None:
-            configured_model = model
-        else:
-            configured_model = os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL)
-        if not configured_model or not isinstance(configured_model, str) or not configured_model.strip():
-            raise PerformanceInsightAIServiceError("GROQ_MODEL configuration is missing or invalid.")
-        self.model = configured_model.strip()
-
-        self.base_url = base_url or os.getenv("GROQ_BASE_URL", "https://api.groq.com")
-        self.timeout = float(os.getenv("GROQ_TIMEOUT_SECONDS", str(timeout)))
-        self.max_retries = max_retries
+        self.config = config
+        self.api_key = config.api_key
+        self.model = config.model
+        self.base_url = config.base_url
+        self.timeout = config.timeout
+        self.deadline = config.deadline
+        self.max_retries = config.max_retries
         self._client = client
 
     def _get_client(self) -> Groq:
@@ -247,7 +225,15 @@ class PerformanceInsightAIService:
             raise PerformanceInsightAIServiceError(
                 "GROQ_API_KEY is not configured. Please set the GROQ_API_KEY environment variable."
             )
-        return Groq(api_key=self.api_key, base_url=self.base_url, timeout=self.timeout)
+        try:
+            return create_groq_client(
+                config=self.config,
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=self.timeout,
+            )
+        except GroqConfigurationError as exc:
+            raise PerformanceInsightAIServiceError(str(exc)) from exc
 
     def _call_groq_with_resilience(
         self,
@@ -256,76 +242,31 @@ class PerformanceInsightAIService:
     ) -> str:
         """Calls Groq API with timeout, retry, backoff, and deadline enforcement."""
         client = self._get_client()
-        attempts = 1 + self.max_retries
-        last_exception: Exception | None = None
-
-        for attempt in range(attempts):
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise PerformanceInsightAIServiceError(
-                        "AI request deadline exceeded. Service temporarily unavailable."
-                    )
-                effective_timeout = min(self.timeout, max(0.5, remaining))
-            else:
-                effective_timeout = self.timeout
-
-            try:
-                response = client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": GROQ_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=0.2,
-                    response_format={"type": "json_object"},
-                    timeout=effective_timeout,
-                )
-                raw_content = response.choices[0].message.content
-                if not raw_content:
-                    raise PerformanceInsightAIServiceError("Groq returned an empty response.")
-                return raw_content
-
-            except (RateLimitError, APIConnectionError, APITimeoutError) as e:
-                last_exception = e
-                logger.warning(
-                    "Transient Groq error (%s) on attempt %d/%d.",
-                    type(e).__name__,
-                    attempt + 1,
-                    attempts,
-                )
-                if attempt < self.max_retries:
-                    jitter = 0.8 + 0.4 * random.random()
-                    backoff = INITIAL_BACKOFF_SECONDS * (2**attempt) * jitter
-                    if deadline is not None and (time.monotonic() + backoff >= deadline):
-                        raise PerformanceInsightAIServiceError(
-                            "AI request deadline exceeded during retry backoff. Service temporarily unavailable."
-                        ) from None
-                    time.sleep(backoff)
-                    continue
-
-            except (AuthenticationError, BadRequestError) as e:
-                logger.error("Non-retriable Groq client error: %s", e)
-                raise PerformanceInsightAIServiceError(
-                    f"Groq API client error: {e!s}"
-                ) from e
-
-            except APIError as e:
-                logger.error("Groq API error on attempt %d/%d: %s", attempt + 1, attempts, e)
-                last_exception = e
-                if attempt < self.max_retries:
-                    time.sleep(INITIAL_BACKOFF_SECONDS * (attempt + 1))
-                    continue
-
-            except Exception as e:
-                logger.error("Unexpected error during Groq API call: %s", e)
-                raise PerformanceInsightAIServiceError(
-                    f"Unexpected error calling AI provider: {e!s}"
-                ) from e
-
-        raise PerformanceInsightAIServiceError(
-            f"Groq API call failed after {attempts} attempts: {last_exception!s}"
-        ) from last_exception
+        try:
+            return execute_chat_completion(
+                client=client,
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": GROQ_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.2,
+                response_format={"type": "json_object"},
+                timeout=self.timeout,
+                deadline=deadline,
+                max_retries=self.max_retries,
+                error_label="Groq API call",
+            )
+        except GroqDeadlineExceededError as exc:
+            raise PerformanceInsightAIServiceError(
+                "AI request deadline exceeded. Service temporarily unavailable."
+            ) from exc
+        except GroqClientError as exc:
+            raise PerformanceInsightAIServiceError(f"Groq API client error: {exc}") from exc
+        except GroqEmptyResponseError as exc:
+            raise PerformanceInsightAIServiceError("Groq returned an empty response.") from exc
+        except GroqProviderError as exc:
+            raise PerformanceInsightAIServiceError(str(exc)) from exc
 
     def _validate_safety_policy(self, output: PerformanceInsightAIGeneration) -> None:
         """Validates that output contains no prohibited employment decisions or ungrounded root causes."""
@@ -446,9 +387,9 @@ class PerformanceInsightAIService:
             + [dec.summary for dec in output.declines]
         )
         cited_nums = _extract_numbers_from_text(metric_claim_text)
-        for num in cited_nums:
-            matched = any(abs(num - c_num) < 0.05 for c_num in context_numbers)
-            if not matched:
+        is_valid, ungrounded = validate_numeric_grounding(cited_nums, context_numbers, tolerance=0.05)
+        if not is_valid:
+            for num in ungrounded:
                 logger.warning("Rejected ungrounded numeric claim: %s", num)
                 raise PerformanceInsightAIServiceError(
                     f"Grounding failure: numeric value '{num}' mentioned in AI output does not match any metric or trend in the supplied context."

@@ -12,6 +12,11 @@ from app.models import (
     Skill,
     TaskOutcome,
 )
+from app.services.shared_hr_data import (
+    build_shared_career_context,
+    get_shared_employee,
+    is_shared_hr_schema,
+)
 
 REQUIRED_CATEGORIES = [
     "performance",
@@ -160,6 +165,35 @@ class CareerCoachContextBuilder:
         - Exposes source IDs and canonical types for grounding validation.
         - Detects missing data categories without fabricating facts.
         """
+        if is_shared_hr_schema(db.get_bind()):
+            shared_employee = get_shared_employee(db, employee_id)
+            if not shared_employee:
+                return {
+                    "has_sufficient_data": False,
+                    "missing_categories": REQUIRED_CATEGORIES.copy(),
+                    "error": f"Employee with id '{employee_id}' not found.",
+                    "context": None,
+                    "approved_sources": {},
+                    "selected_source_ids": {},
+                }
+            result = build_shared_career_context(
+                db=db,
+                employee=shared_employee,
+                period=period,
+                limits={
+                    "performance": MAX_PERFORMANCE_RECORDS,
+                    "goals": MAX_GOALS,
+                    "task_outcomes": MAX_TASK_OUTCOMES,
+                    "evaluation_themes": MAX_EVALUATION_THEMES,
+                },
+            )
+            result["context"], result["approved_sources"], result["selected_source_ids"] = (
+                CareerCoachContextBuilder.enforce_total_context_limit(
+                    result["context"], period=period, max_chars=MAX_TOTAL_CONTEXT_CHARS
+                )
+            )
+            return result
+
         employee = db.query(Employee).filter(Employee.id == employee_id).first()
         if not employee:
             return {

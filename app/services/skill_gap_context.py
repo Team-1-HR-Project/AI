@@ -22,6 +22,11 @@ from app.models import (
     Skill,
     TaskOutcome,
 )
+from app.services.shared_hr_data import (
+    build_shared_career_context,
+    get_shared_employee,
+    is_shared_hr_schema,
+)
 
 # Canonical source types matching existing system conventions
 CANONICAL_SOURCE_TYPES = (
@@ -168,6 +173,32 @@ class SkillGapContextBuilder:
         - Indexes approved sources by (source_type, source_id).
         - Evaluates data sufficiency before any AI invocation.
         """
+        if is_shared_hr_schema(db.get_bind()):
+            employee = get_shared_employee(db, employee_id)
+            if not employee:
+                return {
+                    "has_sufficient_data": False,
+                    "missing_categories": ["employee", "skills"],
+                    "error": f"Employee with id '{employee_id}' not found.",
+                    "context": None,
+                    "approved_sources": {},
+                    "selected_source_ids": {},
+                }
+            result = build_shared_career_context(
+                db, employee, period,
+                {"performance": MAX_PERFORMANCE_RECORDS, "goals": MAX_GOALS, "task_outcomes": MAX_TASK_OUTCOMES, "evaluation_themes": MAX_EVALUATION_THEMES},
+            )
+            result["missing_categories"] = ["skills"] if not result["context"]["skills"] else []
+            if not any(result["context"][key] for key in ("performance", "goals", "task_outcomes", "evaluation_themes")):
+                result["missing_categories"].append("supporting_records")
+            result["has_sufficient_data"] = not result["missing_categories"]
+            if target_role or target_skills:
+                result["context"]["target"] = {
+                    "target_role": _clean_str(target_role, 100) if target_role else "",
+                    "target_skills": [_clean_str(skill, 50) for skill in (target_skills or [])[:10]],
+                }
+            return result
+
         employee = db.query(Employee).filter(Employee.id == employee_id).first()
         if not employee:
             return {

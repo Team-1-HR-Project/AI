@@ -146,6 +146,7 @@ def test_request_without_session_id_creates_new_session(client, db_session):
             "employee_id": "EMP-ALICE",
             "question": "What is the annual leave rollover limit?",
         },
+        headers={"X-Caller-Employee-ID": "EMP-ALICE", "X-Caller-Role": "employee"},
     )
 
     assert response.status_code == 200
@@ -204,10 +205,13 @@ def test_returned_session_id_can_be_reused(client, db_session):
     mock_service.answer_policy_question.side_effect = fake_answer_policy_question
     app.dependency_overrides[get_policy_ai_service] = lambda: mock_service
 
+    headers = {"X-Caller-Employee-ID": "EMP-ALICE", "X-Caller-Role": "employee"}
+
     # Turn 1: No session_id
     resp1 = client.post(
         "/api/policy-assistant",
         json={"employee_id": "EMP-ALICE", "question": "Question 1"},
+        headers=headers,
     )
     assert resp1.status_code == 200
     session_id = resp1.json()["session_id"]
@@ -216,6 +220,7 @@ def test_returned_session_id_can_be_reused(client, db_session):
     resp2 = client.post(
         "/api/policy-assistant",
         json={"employee_id": "EMP-ALICE", "question": "Question 2", "session_id": session_id},
+        headers=headers,
     )
     assert resp2.status_code == 200
     assert resp2.json()["session_id"] == session_id
@@ -224,6 +229,7 @@ def test_returned_session_id_can_be_reused(client, db_session):
     resp3 = client.post(
         "/api/policy-assistant",
         json={"employee_id": "EMP-ALICE", "question": "Question 3", "session_id": session_id},
+        headers=headers,
     )
     assert resp3.status_code == 200
     assert resp3.json()["session_id"] == session_id
@@ -268,12 +274,12 @@ def test_cross_employee_session_access_is_forbidden(client, db_session):
             "question": "Can I see this session?",
             "session_id": "session-alice-12345",
         },
+        headers={"X-Caller-Employee-ID": "EMP-BOB", "X-Caller-Role": "employee"},
     )
 
     assert response.status_code == 403
     data = response.json()
-    assert "Access denied" in data["detail"]
-    assert "session belongs to another employee" in data["detail"]
+    assert "belongs to another employee" in data["detail"]
 
 
 def test_invalid_or_nonexistent_session_id_returns_404(client, db_session):
@@ -288,6 +294,7 @@ def test_invalid_or_nonexistent_session_id_returns_404(client, db_session):
             "question": "What is the policy?",
             "session_id": "nonexistent-session-uuid",
         },
+        headers={"X-Caller-Employee-ID": "EMP-ALICE", "X-Caller-Role": "employee"},
     )
 
     assert response.status_code == 404
@@ -308,6 +315,7 @@ def test_fallback_unsupported_question_persists_messages(client, db_session):
             "employee_id": "EMP-ALICE",
             "question": "Can you recommend a great pizza restaurant?",
         },
+        headers={"X-Caller-Employee-ID": "EMP-ALICE", "X-Caller-Role": "employee"},
     )
 
     assert response.status_code == 200

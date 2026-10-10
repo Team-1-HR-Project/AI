@@ -50,6 +50,15 @@ def db_session():
 
 @pytest.fixture
 def client(db_session):
+    db_session.add(Employee(
+        id="EMP-TEST-CALLER",
+        first_name="Test",
+        last_name="Caller",
+        role_title="HR Administrator",
+        department="Human Resources",
+    ))
+    db_session.commit()
+
     def override_get_db():
         try:
             yield db_session
@@ -57,7 +66,13 @@ def client(db_session):
             pass
 
     app.dependency_overrides[get_db] = override_get_db
-    with TestClient(app) as test_client:
+    with TestClient(
+        app,
+        headers={
+            "X-Caller-Employee-ID": "EMP-TEST-CALLER",
+            "X-Caller-Role": "hr_admin",
+        },
+    ) as test_client:
         yield test_client
     app.dependency_overrides.clear()
 
@@ -293,4 +308,3 @@ def test_api_evaluation_draft_ai_error_returns_502(client, seed_data, mock_ai_se
     data = response.json()
     assert "AI service temporarily unavailable" in data["detail"]
     assert "Reference ID:" in data["detail"]
-

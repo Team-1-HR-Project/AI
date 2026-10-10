@@ -381,9 +381,16 @@ Request payload example:
 
 ## Development & Testing
 
+### Current AI Routes and Authorization
+
+The service currently exposes seven AI routes: Career Coach, HR Policy Assistant, Performance Insight, Evaluation Draft, Skill Gap, Attention Signal, and Team Insight. All AI routes require the trusted gateway headers `X-Caller-Employee-ID` and `X-Caller-Role`; employee ownership, manager department scope, HR-admin organization scope, and policy chat-session ownership are enforced server-side.
+
+Durable insight history and feedback are available under `/api/insights` through the history, snapshot, regeneration, and feedback endpoints. Only approved HR records and explicitly active/approved policies are eligible for AI context.
+
+### Running Tests
+
 ### Running Tests
 All unit and integration tests can be executed via:
 ```powershell
 python -m pytest -v
 ```
-

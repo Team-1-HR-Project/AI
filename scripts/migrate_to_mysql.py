@@ -1,4 +1,6 @@
 import os
+import os
+import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -40,7 +42,7 @@ def parse_date(date_str):
                 return dt
             except ValueError:
                 pass
-    return datetime.now(timezone.utc)
+    raise ValueError(f'Invalid migration date value: {date_str!r}')
 
 def parse_is_approved(row) -> bool:
     """Fail-closed extraction of is_approved state from source rows.
@@ -55,11 +57,15 @@ def parse_is_approved(row) -> bool:
     return False
 
 def ensure_database_exists():
-    db_user = os.getenv('DB_USER', 'root')
-    db_password = os.getenv('DB_PASSWORD', '')
+    db_user = os.getenv('DB_USER')
+    db_password = os.getenv('DB_PASSWORD')
+    if not db_user or not db_password:
+        raise ValueError('Missing explicit DB_USER or DB_PASSWORD. Implicit root/empty fallbacks are prohibited.')
     db_host = os.getenv('DB_HOST', '127.0.0.1')
     db_port = int(os.getenv('DB_PORT', '3306'))
     db_name = os.getenv('DB_NAME', 'hr_system')
+    if not re.fullmatch(r'[A-Za-z0-9_]+', db_name):
+        raise ValueError('DB_NAME contains invalid characters; use only letters, numbers, and underscores.')
 
     print(f'Connecting to MySQL server at {db_host}:{db_port} as user {db_user}...')
     conn = pymysql.connect(
@@ -239,8 +245,11 @@ def migrate_data():
                     )
                     db.add(pol)
             db.commit()
-        except sqlite3.OperationalError:
-            pass
+        except sqlite3.OperationalError as exc:
+            db.rollback()
+            raise RuntimeError(
+                'Company policy migration failed: the source table is missing or incompatible.'
+            ) from exc
 
         print('Verification Report in MySQL:')
         counts = {

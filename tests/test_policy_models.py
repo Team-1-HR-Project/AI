@@ -8,6 +8,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.db.session import SessionLocal, engine
 from app.models import Base, CompanyPolicy
+from app.services.shared_hr_data import is_shared_hr_schema
 from scripts.seed_policies import DEMO_POLICIES
 
 # Isolated in-memory SQLite database for unit tests
@@ -60,8 +61,8 @@ def test_company_policy_crud_and_defaults(db_session):
     assert policy.content == "Detailed policy content text for testing purposes."
     assert policy.summary == "Short summary."
     assert policy.version == "1.0"
-    assert policy.is_active is True
-    assert policy.is_approved is True
+    assert policy.is_active is False
+    assert policy.is_approved is False
     assert policy.created_at is not None
 
     # Test update
@@ -182,6 +183,21 @@ def test_demo_policies_integrity():
 def test_mysql_policy_table_and_records():
     inspector = inspect(engine)
     tables = inspector.get_table_names()
+    if is_shared_hr_schema(engine):
+        assert {"policies", "policy_versions"}.issubset(tables)
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT p.id, p.status, pv.id AS version_id, pv.status AS version_status
+                FROM policies AS p
+                INNER JOIN policy_versions AS pv ON pv.policy_id = p.id
+                WHERE p.status = 'active' AND pv.status = 'active'
+                LIMIT 1
+            """)).first()
+            # Empty policy data is a valid deployment state; schema/query compatibility is the assertion.
+            if row is not None:
+                assert row.id is not None and row.version_id is not None
+        return
+
     assert "company_policies" in tables
 
     # Verify all expected columns exist

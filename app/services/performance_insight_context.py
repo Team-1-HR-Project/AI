@@ -13,6 +13,11 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.models import Employee, PerformanceRecord
+from app.services.shared_hr_data import (
+    build_shared_performance_context,
+    get_shared_employee,
+    is_shared_hr_schema,
+)
 
 # Context budget limits
 MAX_PERFORMANCE_RECORDS = 10
@@ -125,6 +130,17 @@ class PerformanceInsightContextBuilder:
         - Unapproved records (is_approved=False) are strictly excluded
         - Cross-period comparison requires >= 2 approved records
         """
+        if is_shared_hr_schema(db.get_bind()):
+            employee = get_shared_employee(db, employee_id)
+            if employee is None:
+                return {
+                    "employee": None, "has_sufficient_data": False, "has_trend_data": False,
+                    "reason": f"Employee '{employee_id}' not found.", "target_period": period,
+                    "comparison_period": None, "facts": {"records_count": 0, "periods": [], "metrics_by_period": []},
+                    "metrics_by_period": [], "calculated_trends": {"comparison_available": False, "from_period": None, "to_period": None, "metric_trends": {}, "period_over_period": []}, "trends": {},
+                }
+            return build_shared_performance_context(db, employee, period, limit, min_periods)
+
         # 1. Verify employee exists and extract safe identity fields only
         employee = db.query(Employee).filter(Employee.id == employee_id).first()
         if not employee:

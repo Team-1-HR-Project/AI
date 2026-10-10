@@ -165,3 +165,101 @@ def migrate_chat_message_embedding_column(bind: Engine) -> dict[str, Any]:
 
     return report
 
+
+def migrate_ai_audit_events_table(bind: Engine) -> dict[str, Any]:
+    """Safely and idempotently ensures the `ai_audit_events` table exists.
+
+    Parameters
+    ----------
+    bind : Engine
+        SQLAlchemy engine for MySQL or SQLite.
+
+    Returns
+    -------
+    dict[str, Any]
+        Migration report detailing whether table was created or was already present.
+    """
+    inspector = inspect(bind)
+    existing_tables: set[str] = set(inspector.get_table_names())
+    report: dict[str, Any] = {
+        "table": "ai_audit_events",
+        "table_created": False,
+        "already_present": False,
+    }
+
+    if "ai_audit_events" in existing_tables:
+        report["already_present"] = True
+        return report
+
+    logger.info("Creating 'ai_audit_events' table...")
+    from app.models import AIAuditEvent
+
+    AIAuditEvent.__table__.create(bind=bind, checkfirst=True)
+    report["table_created"] = True
+    return report
+
+
+def migrate_ai_snapshots_tables(bind: Engine) -> dict[str, Any]:
+    """Safely and idempotently ensures `ai_insight_snapshots` and `ai_feedbacks` tables exist.
+
+    Parameters
+    ----------
+    bind : Engine
+        SQLAlchemy engine for MySQL or SQLite.
+
+    Returns
+    -------
+    dict[str, Any]
+        Migration report detailing whether tables were created or already present.
+    """
+    inspector = inspect(bind)
+    existing_tables: set[str] = set(inspector.get_table_names())
+    report: dict[str, Any] = {
+        "snapshots_table_created": False,
+        "snapshots_already_present": False,
+        "feedbacks_table_created": False,
+        "feedbacks_already_present": False,
+    }
+
+    from app.models import AIFeedback, AIInsightSnapshot
+
+    if "ai_insight_snapshots" in existing_tables:
+        report["snapshots_already_present"] = True
+        _migrate_ai_snapshot_columns(bind)
+    else:
+        logger.info("Creating 'ai_insight_snapshots' table...")
+        AIInsightSnapshot.__table__.create(bind=bind, checkfirst=True)
+        report["snapshots_table_created"] = True
+
+    if "ai_feedbacks" in existing_tables:
+        report["feedbacks_already_present"] = True
+    else:
+        logger.info("Creating 'ai_feedbacks' table...")
+        AIFeedback.__table__.create(bind=bind, checkfirst=True)
+        report["feedbacks_table_created"] = True
+
+    return report
+
+
+def _migrate_ai_snapshot_columns(bind: Engine) -> None:
+    """Adds reproducibility and lineage columns to pre-existing snapshot tables."""
+    inspector = inspect(bind)
+    columns = {column["name"] for column in inspector.get_columns("ai_insight_snapshots")}
+    missing = {
+        "source_version": "VARCHAR(100)",
+        "source_hash": "VARCHAR(64)",
+        "context_hash": "VARCHAR(64)",
+        "prompt_hash": "VARCHAR(64)",
+        "provider": "VARCHAR(50)",
+        "model": "VARCHAR(150)",
+        "request_payload": "TEXT",
+        "previous_snapshot_id": "VARCHAR(36)",
+        "regenerated_at": "DATETIME",
+        "regeneration_reason": "TEXT",
+        "source_changed": "BOOLEAN",
+    }
+    with bind.begin() as conn:
+        for name, sql_type in missing.items():
+            if name in columns:
+                continue
+            conn.execute(text(f"ALTER TABLE ai_insight_snapshots ADD COLUMN {name} {sql_type} NULL"))

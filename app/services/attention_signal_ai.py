@@ -10,24 +10,29 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import random
 import re
 import time
 from typing import Any
 
 from groq import (
-    APIConnectionError,
-    APIError,
-    APITimeoutError,
-    AuthenticationError,
-    BadRequestError,
     Groq,
-    RateLimitError,
 )
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.orm import Session
 
+from app.core.groq_provider import (
+    DEFAULT_DEADLINE_SECONDS,
+    DEFAULT_TIMEOUT_SECONDS,
+    MAX_RETRIES,
+    GroqClientError,
+    GroqConfigurationError,
+    GroqDeadlineExceededError,
+    GroqEmptyResponseError,
+    GroqProviderError,
+    create_groq_client,
+    execute_chat_completion,
+    resolve_groq_config,
+)
 from app.schemas.attention_signal import (
     AttentionLevel,
     AttentionSignalInsufficientDataResponse,
@@ -38,14 +43,14 @@ from app.schemas.attention_signal import (
     utc_now,
 )
 from app.services.attention_signal_context import AttentionSignalContextBuilder
+from app.services.grounding import (
+    extract_business_metrics_from_text,
+    extract_grounded_facts_from_context,
+    get_allowed_numeric_set,
+    validate_numeric_grounding,
+)
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
-DEFAULT_TIMEOUT_SECONDS = 30.0
-DEFAULT_DEADLINE_SECONDS = 25.0
-MAX_RETRIES = 2
-INITIAL_BACKOFF_SECONDS = 0.5
 
 # Prohibited Employment Decisions, Disciplinary Actions & Resignation Predictions
 PROHIBITED_PATTERNS = [
@@ -179,97 +184,31 @@ class AttentionSignalModelOutput(BaseModel):
 def _extract_numbers_from_text(text: str) -> list[float]:
     """Extracts numeric values (integers, floats, percentages) from text.
 
-    Ignores calendar years, quarter/year references (e.g. '2026-Q3', 'Q3 2026', '2026'),
-    and database record identifiers (e.g. 'PerformanceRecord #2', '#2', 'Goal #5'),
-    so they are not treated as ungrounded quantitative metrics.
+    Ignores calendar years, quarter/year references, IDs, and standard date formats.
     """
-    # Ignore calendar and quarter formats
-    cleaned = re.sub(r"\b\d{4}[-_/ ]?Q[1-4]\b", " ", text, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\bQ[1-4][-_/ ]?\d{4}\b", " ", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(19\d\d|20\d\d)\b", " ", cleaned)
-
-    # Ignore database record identifier references like 'PerformanceRecord #2', 'Goal #5', or '#123'
-    cleaned = re.sub(
-        r"\b(?:PerformanceRecord|Goal|TaskOutcome|EvaluationTheme|Skill)\s*#\d+\b",
-        " ",
-        cleaned,
-        flags=re.IGNORECASE,
-    )
-    cleaned = re.sub(r"#\d+\b", " ", cleaned)
-
-    tokens = re.findall(r"[-+]?\d*\.?\d+", cleaned)
-    results: list[float] = []
-    for tok in tokens:
-        try:
-            val = float(tok)
-            results.append(round(val, 2))
-        except (ValueError, TypeError):
-            continue
-    return results
+    return extract_business_metrics_from_text(text)
 
 
 def _extract_context_numbers(context: dict[str, Any]) -> set[float]:
     """Extracts all valid numerical values present in the context metrics and summaries."""
-    nums: set[float] = set()
+    facts = extract_grounded_facts_from_context(context)
+    nums = get_allowed_numeric_set(facts)
 
-    def add_num(v: Any) -> None:
-        if isinstance(v, (int, float)):
-            f_val = round(float(v), 2)
-            nums.add(f_val)
-            nums.add(round(abs(f_val), 2))
-            nums.add(round(f_val, 1))
-            nums.add(float(int(f_val)))
-        elif isinstance(v, str):
-            for n in _extract_numbers_from_text(v):
-                nums.add(n)
-                nums.add(round(abs(n), 2))
-
-    # From target and comparison metrics
-    for metrics_dict in (context.get("target_metrics"), context.get("comparison_metrics")):
-        if isinstance(metrics_dict, dict):
-            for k, val in metrics_dict.items():
-                if k not in ("period", "id", "employee_id"):
-                    add_num(val)
-
-    # From calculated trends
-    for t_data in context.get("metric_trends", {}).values():
-        if isinstance(t_data, dict):
-            for k in ("previous_value", "current_value", "delta", "percent_change"):
-                add_num(t_data.get(k))
-
-    # From summaries
-    for summary_key in ("task_summary", "goal_summary", "evaluation_summary"):
-        s_data = context.get(summary_key, {})
-        if isinstance(s_data, dict):
-            for k, val in s_data.items():
-                if isinstance(val, (int, float)):
-                    add_num(val)
-
-    # From delayed goals
-    for g in context.get("goal_summary", {}).get("delayed_goals", []):
-        if isinstance(g, dict) and "progress" in g:
-            add_num(g["progress"])
-
-    # From approved sources
-    for src in context.get("approved_sources", {}).values():
-        if isinstance(src, dict):
-            for k, v in src.items():
-                if k not in ("id", "employee_id", "period") and isinstance(v, (int, float)):
-                    add_num(v)
-
-    # From deterministic context rule thresholds
+    # Also include indicators and deterministic thresholds if present
     for thresh in DETERMINISTIC_CONTEXT_THRESHOLDS:
-        add_num(thresh)
+        nums.add(float(thresh))
 
-    # From indicators (including change descriptions and evidence generated by context builder)
     for ind in context.get("indicators", []):
         if isinstance(ind, dict):
-            add_num(ind.get("current_value"))
-            add_num(ind.get("previous_value"))
-            if ind.get("change_description"):
-                add_num(ind["change_description"])
-            if ind.get("evidence"):
-                add_num(ind["evidence"])
+            for k in ("current_value", "previous_value"):
+                val = ind.get(k)
+                if isinstance(val, (int, float)):
+                    nums.add(float(val))
+            for k in ("change_description", "evidence"):
+                txt = ind.get(k)
+                if isinstance(txt, str):
+                    for n in extract_business_metrics_from_text(txt):
+                        nums.add(n)
 
     return nums
 
@@ -286,19 +225,24 @@ class AttentionSignalAIService:
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         max_retries: int = MAX_RETRIES,
     ):
-        self.api_key = api_key or os.getenv("GROQ_API_KEY")
+        try:
+            config = resolve_groq_config(
+                api_key=api_key,
+                model=model,
+                base_url=base_url,
+                timeout=timeout,
+                max_retries=max_retries,
+            )
+        except GroqConfigurationError as exc:
+            raise AttentionSignalAIServiceError(str(exc)) from exc
 
-        if model is not None:
-            configured_model = model
-        else:
-            configured_model = os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL)
-        if not configured_model or not isinstance(configured_model, str) or not configured_model.strip():
-            raise AttentionSignalAIServiceError("GROQ_MODEL configuration is missing or invalid.")
-        self.model = configured_model.strip()
-
-        self.base_url = base_url or os.getenv("GROQ_BASE_URL", "https://api.groq.com")
-        self.timeout = float(os.getenv("GROQ_TIMEOUT_SECONDS", str(timeout)))
-        self.max_retries = max_retries
+        self.config = config
+        self.api_key = config.api_key
+        self.model = config.model
+        self.base_url = config.base_url
+        self.timeout = config.timeout
+        self.deadline = config.deadline
+        self.max_retries = config.max_retries
         self._client = client
 
     def _get_client(self) -> Groq:
@@ -308,7 +252,15 @@ class AttentionSignalAIService:
             raise AttentionSignalAIServiceError(
                 "GROQ_API_KEY is not configured. Please set the GROQ_API_KEY environment variable."
             )
-        return Groq(api_key=self.api_key, base_url=self.base_url, timeout=self.timeout)
+        try:
+            return create_groq_client(
+                config=self.config,
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=self.timeout,
+            )
+        except GroqConfigurationError as exc:
+            raise AttentionSignalAIServiceError(str(exc)) from exc
 
     def _call_llm_with_retry(
         self,
@@ -317,67 +269,34 @@ class AttentionSignalAIService:
     ) -> str:
         """Invokes Groq with exponential backoff retries and deadline enforcement."""
         client = self._get_client()
-        attempts = self.max_retries + 1
-        last_exception: Exception | None = None
-
-        for attempt in range(attempts):
-            if deadline is not None and time.monotonic() >= deadline:
-                raise AttentionSignalAIServiceError(
-                    "AI request deadline exceeded before provider invocation. Service temporarily unavailable."
-                )
-
-            try:
-                response = client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": GROQ_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=0.1,
-                    max_tokens=2048,
-                    response_format={"type": "json_object"},
-                )
-
-                content = response.choices[0].message.content
-                if not content or not content.strip():
-                    raise AttentionSignalAIServiceError("Empty response returned from AI provider.")
-                return content.strip()
-
-            except (APIConnectionError, APITimeoutError) as exc:
-                last_exception = exc
-                logger.warning(
-                    "Groq transient connection error (attempt %d/%d): %s",
-                    attempt + 1,
-                    attempts,
-                    exc,
-                )
-            except RateLimitError as exc:
-                last_exception = exc
-                logger.warning(
-                    "Groq rate limit encountered (attempt %d/%d): %s",
-                    attempt + 1,
-                    attempts,
-                    exc,
-                )
-            except (AuthenticationError, BadRequestError) as exc:
-                logger.error("Groq non-retryable client error: %s", exc)
-                raise AttentionSignalAIServiceError(
-                    "AI provider configuration or request formatting error."
-                ) from exc
-            except APIError as exc:
-                last_exception = exc
-                logger.warning("Groq API error (attempt %d/%d): %s", attempt + 1, attempts, exc)
-            except Exception as exc:
-                logger.error("Unexpected error during AI provider call: %s", exc)
-                raise AttentionSignalAIServiceError("Unexpected AI provider communication failure.") from exc
-
-            if attempt < attempts - 1:
-                backoff = INITIAL_BACKOFF_SECONDS * (2**attempt) + random.uniform(0.05, 0.2)
-                time.sleep(backoff)
-
-        raise AttentionSignalAIServiceError(
-            f"AI provider failed after {attempts} attempts. Last error: {last_exception}"
-        )
+        try:
+            return execute_chat_completion(
+                client=client,
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": GROQ_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.1,
+                max_tokens=2048,
+                response_format={"type": "json_object"},
+                timeout=self.timeout,
+                deadline=deadline,
+                max_retries=self.max_retries,
+                error_label="AI provider",
+            )
+        except GroqDeadlineExceededError as exc:
+            raise AttentionSignalAIServiceError(
+                "AI request deadline exceeded. Service temporarily unavailable."
+            ) from exc
+        except GroqClientError as exc:
+            raise AttentionSignalAIServiceError(
+                "AI provider configuration or request formatting error."
+            ) from exc
+        except GroqEmptyResponseError as exc:
+            raise AttentionSignalAIServiceError("Empty response returned from AI provider.") from exc
+        except GroqProviderError as exc:
+            raise AttentionSignalAIServiceError(str(exc)) from exc
 
     def _check_prohibited_terms(self, text: str) -> None:
         """Enforces absolute prohibition of employment decisions, PIPs, and resignation predictions."""
@@ -436,29 +355,31 @@ class AttentionSignalAIService:
         for ind in output.contributing_indicators:
             # Check numbers in evidence
             ev_nums = _extract_numbers_from_text(ind.evidence)
-            for num in ev_nums:
-                if not any(abs(num - c_num) < 1e-4 for c_num in context_numbers):
-                    logger.warning(
-                        "Attention signal output rejected: ungrounded number %s in indicator evidence: '%s'",
-                        num,
-                        ind.evidence,
-                    )
-                    raise AttentionSignalAIServiceError(
-                        f"Grounding validation failure: numeric value '{num}' in evidence is not supported by context."
-                    )
+            is_valid, ungrounded = validate_numeric_grounding(ev_nums, context_numbers, tolerance=1e-4)
+            if not is_valid:
+                num = ungrounded[0]
+                logger.warning(
+                    "Attention signal output rejected: ungrounded number %s in indicator evidence: '%s'",
+                    num,
+                    ind.evidence,
+                )
+                raise AttentionSignalAIServiceError(
+                    f"Grounding validation failure: numeric value '{num}' in evidence is not supported by context."
+                )
 
             # Check numbers in change description
             desc_nums = _extract_numbers_from_text(ind.change_description)
-            for num in desc_nums:
-                if not any(abs(num - c_num) < 1e-4 for c_num in context_numbers):
-                    logger.warning(
-                        "Attention signal output rejected: ungrounded number %s in change description: '%s'",
-                        num,
-                        ind.change_description,
-                    )
-                    raise AttentionSignalAIServiceError(
-                        f"Grounding validation failure: numeric value '{num}' in change description is not supported by context."
-                    )
+            is_valid, ungrounded = validate_numeric_grounding(desc_nums, context_numbers, tolerance=1e-4)
+            if not is_valid:
+                num = ungrounded[0]
+                logger.warning(
+                    "Attention signal output rejected: ungrounded number %s in change description: '%s'",
+                    num,
+                    ind.change_description,
+                )
+                raise AttentionSignalAIServiceError(
+                    f"Grounding validation failure: numeric value '{num}' in change description is not supported by context."
+                )
 
     def generate_attention_signal(
         self,

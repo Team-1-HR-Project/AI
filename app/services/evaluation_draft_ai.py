@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import random
 import re
 import time
@@ -27,6 +26,20 @@ from groq import (
 )
 from pydantic import ValidationError
 
+from app.core.groq_provider import (
+    DEFAULT_TIMEOUT_SECONDS,
+    INITIAL_BACKOFF_SECONDS,
+    MAX_RETRIES,
+    GroqClientError,
+    GroqConfigurationError,
+    GroqDeadlineExceededError,
+    GroqMaxRetriesExceededError,
+    GroqProviderError,
+    GroqTransientError,
+    create_groq_client,
+    execute_chat_completion,
+    resolve_groq_config,
+)
 from app.schemas.evaluation_draft import (
     EvaluationDraftInsufficientDataResponse,
     EvaluationDraftModelOutput,
@@ -35,14 +48,19 @@ from app.schemas.evaluation_draft import (
     EvidenceItem,
     utc_now,
 )
+from app.services.grounding import (
+    extract_business_metrics_from_text,
+    extract_facts_from_record,
+    validate_evidence_claim_grounding,
+    validate_narrative_grounding,
+)
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
-DEFAULT_TIMEOUT_SECONDS = 30.0
-DEFAULT_DEADLINE_SECONDS = 25.0
-MAX_RETRIES = 2
-INITIAL_BACKOFF_SECONDS = 0.5
+
+class EvaluationEvidenceGroundingError(ValueError):
+    """Raised when an evaluation draft claim or narrative sentence fails semantic or field grounding."""
+
 
 # Prohibited Employment Decisions & Compensation Keywords
 PROHIBITED_PATTERNS = [
@@ -120,33 +138,17 @@ def _normalize_num(val: Any) -> float | None:
 
 
 def _extract_numbers_from_text(text: str) -> list[float]:
-    """Extracts numeric values (integers, floats, percentages) from a text string."""
-    pattern = r"(?<!\w)(?:\d{4}-\d{2}-\d{2}|\d{4}-Q\d|\d{4})|(?<!\w)-?\d+(?:\.\d+)?%?"
-    matches = re.findall(pattern, text)
-    numbers = []
-    for m in matches:
-        if "-" in m and not m.startswith("-"):
-            continue
-        clean = m.rstrip("%")
-        try:
-            numbers.append(float(clean))
-        except ValueError:
-            pass
-    return numbers
+    """Extracts numeric values (integers, floats, percentages) from a text string.
+
+    Ignores calendar years, quarter/year references, IDs, and standard date formats.
+    """
+    return extract_business_metrics_from_text(text)
 
 
 def _extract_numbers_from_record(rec: dict[str, Any]) -> set[float]:
     """Extracts all numeric values present in a source record."""
-    numbers: set[float] = set()
-    for k, v in rec.items():
-        if k in ("id", "employee_id"):
-            continue
-        if isinstance(v, (int, float)):
-            numbers.add(float(v))
-        elif isinstance(v, str):
-            for num in _extract_numbers_from_text(v):
-                numbers.add(num)
-    return numbers
+    facts = extract_facts_from_record("source", rec)
+    return {f.value for f in facts}
 
 
 def _sanitize_untrusted_text(text: str | None) -> str:
@@ -161,19 +163,56 @@ def _sanitize_untrusted_text(text: str | None) -> str:
 class EvaluationDraftAIService:
     """Service to generate grounded evaluation drafts using Groq and strict validation."""
 
-    def __init__(self, client: Groq | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        client: Groq | None = None,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        max_retries: int = MAX_RETRIES,
+    ) -> None:
+        if client is None and api_key is not None and not isinstance(api_key, str):
+            client = api_key
+            api_key = None
+
+        try:
+            config = resolve_groq_config(
+                api_key=api_key,
+                model=model,
+                base_url=base_url,
+                timeout=timeout,
+                max_retries=max_retries,
+            )
+        except GroqConfigurationError as exc:
+            raise RuntimeError(f"AI provider configuration error: {exc}") from exc
+
+        self.config = config
+        self.api_key = config.api_key
+        self.model = config.model
+        self.base_url = config.base_url
+        self.timeout = config.timeout
+        self.deadline = config.deadline
+        self.max_retries = config.max_retries
         self.client = client
-        self.model = os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL)
-        self.timeout = float(os.getenv("GROQ_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS))
-        self.deadline = float(os.getenv("GROQ_DEADLINE_SECONDS", DEFAULT_DEADLINE_SECONDS))
+        self._client = client
 
     def _get_client(self) -> Groq:
+        if self._client:
+            return self._client
         if self.client:
             return self.client
-        api_key = os.getenv("GROQ_API_KEY")
-        if not api_key:
+        if not self.api_key:
             raise RuntimeError("GROQ_API_KEY environment variable is not configured.")
-        return Groq(api_key=api_key, timeout=self.timeout)
+        try:
+            return create_groq_client(
+                config=self.config,
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=self.timeout,
+            )
+        except GroqConfigurationError as exc:
+            raise RuntimeError(str(exc)) from exc
 
     def _scan_safety_prohibitions(self, text: str) -> None:
         """Scans text for prohibited employment decisions, compensation changes, or disciplinary terms."""
@@ -189,47 +228,57 @@ class EvaluationDraftAIService:
         self,
         evidence_items: list[EvidenceItem],
         approved_sources: dict[tuple[str, int], dict[str, Any]],
+        context: dict[str, Any] | None = None,
     ) -> None:
-        """Validates that each evidence item exists in approved sources and has grounded numbers."""
+        """Validates that each evidence item exists in approved sources, has grounded numbers, and is semantically supported."""
         for ev in evidence_items:
             key = (ev.source_type, ev.source_id)
             if key not in approved_sources:
-                raise ValueError(
+                raise EvaluationEvidenceGroundingError(
                     f"Hallucinated evidence reference: source_type='{ev.source_type}' "
                     f"with source_id={ev.source_id} does not exist in approved context."
                 )
 
-            # Validate numeric grounding
             source_rec = approved_sources[key]
-            rec_numbers = _extract_numbers_from_record(source_rec)
-            claim_numbers = _extract_numbers_from_text(ev.claim)
 
-            for c_num in claim_numbers:
-                if c_num in (1.0, 2.0, 3.0, 4.0, 5.0, 10.0, 100.0) and not rec_numbers:
-                    continue
-                matched = any(abs(c_num - r_num) < 0.05 for r_num in rec_numbers)
-                if not matched and rec_numbers:
-                    raise ValueError(
-                        f"Ungrounded number {c_num} in claim '{ev.claim}' "
-                        f"does not match verified source record {key}: {source_rec}"
-                    )
+            # 1. Numeric and semantic field-level grounding of the claim against referenced source
+            is_valid, reason = validate_evidence_claim_grounding(
+                claim=ev.claim,
+                source_type=ev.source_type,
+                source_data=source_rec,
+                context=context,
+            )
+            if not is_valid:
+                logger.warning("Evaluation evidence claim rejected: %s", reason)
+                raise EvaluationEvidenceGroundingError(reason or "Evidence claim grounding failure.")
 
     def _validate_model_output(
         self,
         output: EvaluationDraftModelOutput,
         approved_sources: dict[tuple[str, int], dict[str, Any]],
+        context: dict[str, Any] | None = None,
     ) -> None:
-        """Enforces grounding, numeric accuracy, and safety constraints on LLM output."""
+        """Enforces grounding, numeric accuracy, semantic truthfulness, and safety constraints on LLM output."""
         # 1. Safety scans on narrative and item texts
         self._scan_safety_prohibitions(output.evaluation_narrative)
         for s in output.strengths:
             self._scan_safety_prohibitions(s.title)
             self._scan_safety_prohibitions(s.description)
-            self._validate_evidence_items(s.evidence, approved_sources)
+            self._validate_evidence_items(s.evidence, approved_sources, context)
         for imp in output.improvement_areas:
             self._scan_safety_prohibitions(imp.title)
             self._scan_safety_prohibitions(imp.description)
-            self._validate_evidence_items(imp.evidence, approved_sources)
+            self._validate_evidence_items(imp.evidence, approved_sources, context)
+
+        # 2. Semantic and field-level grounding of evaluation narrative sentences
+        is_narrative_valid, narrative_reason = validate_narrative_grounding(
+            narrative=output.evaluation_narrative,
+            approved_sources=approved_sources,
+            context=context,
+        )
+        if not is_narrative_valid:
+            logger.warning("Evaluation narrative rejected: %s", narrative_reason)
+            raise EvaluationEvidenceGroundingError(narrative_reason or "Evaluation narrative grounding failure.")
 
     def generate_draft(
         self,
@@ -290,17 +339,19 @@ Remember:
 """
 
         client = self._get_client()
-        start_time = time.time()
+        start_time = time.monotonic()
+        deadline_time = start_time + self.deadline
         last_error = None
 
-        for attempt in range(MAX_RETRIES + 1):
-            if time.time() - start_time > self.deadline:
+        for attempt in range(self.max_retries + 1):
+            if time.monotonic() - start_time > self.deadline:
                 ref_id = str(uuid.uuid4())
                 logger.error("Evaluation Draft generation timed out against deadline. Ref: %s", ref_id)
                 raise TimeoutError(f"AI service temporarily unavailable. Reference ID: {ref_id}")
 
             try:
-                response = client.chat.completions.create(
+                raw_content = execute_chat_completion(
+                    client=client,
                     model=self.model,
                     messages=[
                         {"role": "system", "content": GROQ_SYSTEM_PROMPT},
@@ -308,9 +359,12 @@ Remember:
                     ],
                     temperature=0.2,
                     max_tokens=2500,
+                    timeout=self.timeout,
+                    deadline=deadline_time,
+                    max_retries=0,
+                    error_label="AI provider",
                 )
 
-                raw_content = response.choices[0].message.content or ""
                 clean_json = raw_content.strip()
                 if clean_json.startswith("```json"):
                     clean_json = clean_json[7:]
@@ -322,8 +376,14 @@ Remember:
                 parsed_data = json.loads(clean_json)
                 model_output = EvaluationDraftModelOutput.model_validate(parsed_data)
 
+                validation_context = dict(context)
+                if manager_notes:
+                    validation_context["manager_notes"] = manager_notes
+                if entered_scores:
+                    validation_context["entered_scores"] = entered_scores
+
                 # Validate grounding and safety constraints
-                self._validate_model_output(model_output, approved_sources)
+                self._validate_model_output(model_output, approved_sources, context=validation_context)
 
                 return EvaluationDraftSuccessResponse(
                     employee_id=employee_id,
@@ -340,20 +400,24 @@ Remember:
                     created_at=utc_now(),
                 )
 
-            except (RateLimitError, APITimeoutError, APIConnectionError) as exc:
+            except GroqDeadlineExceededError as exc:
+                ref_id = str(uuid.uuid4())
+                logger.error("Evaluation Draft generation timed out against deadline. Ref: %s", ref_id)
+                raise TimeoutError(f"AI service temporarily unavailable. Reference ID: {ref_id}") from exc
+            except (RateLimitError, APITimeoutError, APIConnectionError, GroqTransientError, GroqMaxRetriesExceededError) as exc:
                 last_error = exc
                 logger.warning("Transient Groq error on attempt %d: %s", attempt + 1, exc)
-                if attempt < MAX_RETRIES:
+                if attempt < self.max_retries:
                     backoff = INITIAL_BACKOFF_SECONDS * (2**attempt) + random.uniform(0, 0.2)
                     time.sleep(backoff)
                     continue
             except (json.JSONDecodeError, ValidationError, ValueError) as exc:
                 last_error = exc
                 logger.warning("Output validation failed on attempt %d: %s", attempt + 1, exc)
-                if attempt < MAX_RETRIES:
+                if attempt < self.max_retries:
                     time.sleep(0.5)
                     continue
-            except (BadRequestError, AuthenticationError, APIError) as exc:
+            except (BadRequestError, AuthenticationError, APIError, GroqClientError, GroqProviderError) as exc:
                 ref_id = str(uuid.uuid4())
                 logger.error("Non-retryable Groq error: %s. Ref: %s", exc, ref_id)
                 raise RuntimeError(f"AI service temporarily unavailable. Reference ID: {ref_id}") from exc

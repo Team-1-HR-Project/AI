@@ -126,8 +126,9 @@ class CompanyPolicy(Base):
     content = Column(Text, nullable=False)
     summary = Column(Text, nullable=True)
     version = Column(String(20), default="1.0", nullable=False)
-    is_active = Column(Boolean, default=True, server_default="1", nullable=False)
-    is_approved = Column(Boolean, default=True, server_default="1", nullable=False)
+    # Policies are drafts until an explicit HR approval workflow marks them usable.
+    is_active = Column(Boolean, default=False, server_default="0", nullable=False)
+    is_approved = Column(Boolean, default=False, server_default="0", nullable=False)
     created_at = Column(DateTime, default=utc_now, nullable=False)
 
 
@@ -163,3 +164,80 @@ class ChatMessage(Base):
     session = relationship("ChatSession", back_populates="messages")
 
 
+class AIAuditEvent(Base):
+    __tablename__ = "ai_audit_events"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    event_id = Column(String(36), unique=True, index=True, default=lambda: str(uuid.uuid4()))
+    timestamp = Column(DateTime, default=utc_now, nullable=False, index=True)
+
+    # Actor (Caller) Context
+    actor_employee_id = Column(String(50), nullable=True, index=True)
+    actor_role = Column(String(50), nullable=True, index=True)
+
+    # Authorized Scope
+    scope_employee_id = Column(String(50), nullable=True, index=True)
+    scope_department = Column(String(100), nullable=True, index=True)
+    scope_session_id = Column(String(50), nullable=True)
+
+    # AI Feature & Endpoint
+    feature = Column(String(100), nullable=False, index=True)
+    endpoint = Column(String(100), nullable=False)
+
+    # Provider & Model
+    provider = Column(String(50), nullable=False, default="groq")
+    model = Column(String(100), nullable=False)
+
+    # Outcome & Reference
+    outcome = Column(String(50), nullable=False, index=True)
+    reference_id = Column(String(50), nullable=True, index=True)
+
+
+class AIInsightSnapshot(Base):
+    __tablename__ = "ai_insight_snapshots"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    generation_id = Column(String(36), index=True, unique=True, default=lambda: str(uuid.uuid4()), nullable=False)
+    version = Column(Integer, nullable=False, default=1)
+    feature = Column(String(100), nullable=False, index=True)
+    source_version = Column(String(100), nullable=True)
+    source_hash = Column(String(64), nullable=True, index=True)
+    context_hash = Column(String(64), nullable=True, index=True)
+    prompt_hash = Column(String(64), nullable=True)
+    provider = Column(String(50), nullable=True)
+    model = Column(String(150), nullable=True)
+
+    # Scopes
+    scope_employee_id = Column(String(50), nullable=True, index=True)
+    scope_department = Column(String(100), nullable=True, index=True)
+    period = Column(String(50), nullable=True, index=True)
+
+    # Generated Output JSON
+    content = Column(Text, nullable=False)
+    request_payload = Column(Text, nullable=True)
+
+    # Actor Metadata
+    actor_employee_id = Column(String(50), nullable=True, index=True)
+    actor_role = Column(String(50), nullable=True)
+    previous_snapshot_id = Column(String(36), ForeignKey("ai_insight_snapshots.id"), nullable=True, index=True)
+    regenerated_at = Column(DateTime, nullable=True, index=True)
+    regeneration_reason = Column(Text, nullable=True)
+    source_changed = Column(Boolean, nullable=True)
+
+    created_at = Column(DateTime, default=utc_now, nullable=False, index=True)
+
+    feedbacks = relationship("AIFeedback", back_populates="snapshot", cascade="all, delete-orphan")
+
+
+class AIFeedback(Base):
+    __tablename__ = "ai_feedbacks"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    snapshot_id = Column(String(36), ForeignKey("ai_insight_snapshots.id"), nullable=False, index=True)
+    actor_employee_id = Column(String(50), nullable=False, index=True)
+    actor_role = Column(String(50), nullable=False)
+    is_helpful = Column(Boolean, nullable=False)
+    feedback_text = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=utc_now, nullable=False, index=True)
+
+    snapshot = relationship("AIInsightSnapshot", back_populates="feedbacks")

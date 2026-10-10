@@ -25,6 +25,11 @@ from app.services.performance_insight_context import (
     calculate_trend,
     parse_period_key,
 )
+from app.services.shared_hr_data import (
+    build_shared_attention_context,
+    get_shared_employee,
+    is_shared_hr_schema,
+)
 
 # Context budget limits
 MAX_PERFORMANCE_RECORDS = 10
@@ -254,6 +259,40 @@ class AttentionSignalContextBuilder:
         - Extracts blocked tasks, delayed goals, and needs_improvement themes.
         - Never predicts flight risk or triggers automated employment actions.
         """
+        if is_shared_hr_schema(db.get_bind()):
+            employee = get_shared_employee(db, employee_id)
+            employee_dict = None
+            if employee:
+                employee_dict = {
+                    "id": employee.id,
+                    "role_title": _clean_str(employee.role_title, 100),
+                    "department": _clean_str(employee.department, 100),
+                }
+            if employee:
+                return build_shared_attention_context(db, employee, target_period)
+            return {
+                "employee": employee_dict,
+                "has_sufficient_data": False,
+                "reason": (
+                    f"Employee '{employee_id}' not found."
+                    if employee is None
+                    else "The shared HR schema has no approved PerformanceRecord table with the required metric set."
+                ),
+                "target_period": target_period,
+                "comparison_period": None,
+                "assessment_type": None,
+                "attention_level": None,
+                "metric_bands": {},
+                "indicators": [],
+                "metric_trends": {},
+                "target_metrics": None,
+                "comparison_metrics": None,
+                "task_summary": {"total": 0, "completed": 0, "blocked": 0, "in_progress": 0, "blocked_tasks": []},
+                "goal_summary": {"total": 0, "completed": 0, "delayed": 0, "in_progress": 0, "delayed_goals": []},
+                "evaluation_summary": {"total": 0, "needs_improvement_count": 0, "positive_count": 0, "themes": []},
+                "approved_sources": {},
+            }
+
         # 1. Verify employee existence
         employee = db.query(Employee).filter(Employee.id == employee_id).first()
         if not employee:

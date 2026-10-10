@@ -15,6 +15,60 @@ POST /api/career-coach
 }
 ```
 
+---
+
+# AI Attention Signal API
+
+## Primary Endpoint
+`POST /api/attention-signal`
+
+Analyzes approved employee performance/activity context and returns an advisory attention level. The response is not an employment decision and includes human-review safeguards.
+
+## Request
+
+```json
+{
+  "employee_id": "EMP-SEC-ALICE",
+  "period": "2026-Q3"
+}
+```
+
+## Access
+
+AI routes require gateway-provided `X-Caller-Employee-ID` and `X-Caller-Role` headers. Valid roles are `employee`, `manager`, and `hr_admin`; callers are limited to their authorized employee, department, or session scope.
+
+---
+
+# AI Team Insight API
+
+## Primary Endpoint
+`POST /api/team-insight`
+
+Generates an aggregate, anonymized insight for an authorized department using approved team records. Managers are restricted to their own department; HR administrators may request any department.
+
+## Request
+
+```json
+{
+  "department": "Engineering",
+  "period": "2026-Q3"
+}
+```
+
+---
+
+# AI Insight History, Regeneration, and Feedback
+
+Durable AI snapshots are stored with feature, scope, period, model, generation ID, version, and actor context.
+
+- `GET /api/insights/history`
+- `GET /api/insights/{snapshot_id}`
+- `POST /api/insights/{snapshot_id}/regenerate`
+- `POST /api/insights/{snapshot_id}/feedback`
+- `GET /api/insights/{snapshot_id}/feedback`
+
+All insight and feedback operations enforce the same caller authorization rules as generation endpoints. Provider failures return a safe reference ID and do not expose prompts, credentials, or stack traces.
+
 ## Error Handling
 Returns `HTTP 502 Bad Gateway` on AI provider or service failures with a safe reference ID:
 ```json
@@ -465,4 +519,3 @@ Returns `HTTP 502 Bad Gateway` on AI provider or service failures with a safe re
   "created_at": "2026-09-18T04:30:00Z"
 }
 ```
-

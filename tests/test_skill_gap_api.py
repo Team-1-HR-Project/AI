@@ -45,6 +45,15 @@ def db_session():
 
 @pytest.fixture(scope="function")
 def client(db_session):
+    db_session.add(Employee(
+        id="EMP-TEST-CALLER",
+        first_name="Test",
+        last_name="Caller",
+        role_title="HR Administrator",
+        department="Human Resources",
+    ))
+    db_session.commit()
+
     def override_get_db():
         try:
             yield db_session
@@ -52,7 +61,13 @@ def client(db_session):
             pass
 
     app.dependency_overrides[get_db] = override_get_db
-    with TestClient(app) as test_client:
+    with TestClient(
+        app,
+        headers={
+            "X-Caller-Employee-ID": "EMP-TEST-CALLER",
+            "X-Caller-Role": "hr_admin",
+        },
+    ) as test_client:
         yield test_client
     app.dependency_overrides.clear()
 
@@ -464,5 +479,4 @@ def test_unknown_employee_returns_insufficient_data(client, db_session):
     assert data["status"] == "insufficient_data"
     assert data["employee_id"] == "EMP-NONEXISTENT"
     assert "skills" in data["missing_categories"]
-
 

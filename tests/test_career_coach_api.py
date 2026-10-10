@@ -53,8 +53,23 @@ def client(db_session):
         finally:
             pass
 
+    db_session.add(Employee(
+        id="EMP-TEST-CALLER",
+        first_name="Test",
+        last_name="Caller",
+        role_title="HR Administrator",
+        department="Human Resources",
+    ))
+    db_session.commit()
+
     app.dependency_overrides[get_db] = override_get_db
-    with TestClient(app) as test_client:
+    with TestClient(
+        app,
+        headers={
+            "X-Caller-Employee-ID": "EMP-TEST-CALLER",
+            "X-Caller-Role": "hr_admin",
+        },
+    ) as test_client:
         yield test_client
     app.dependency_overrides.clear()
 
@@ -213,6 +228,7 @@ def test_insufficient_data_api_response(client, db_session):
     response = client.post(
         "/api/career-coach",
         json={"employee_id": "EMP-SPARSE"},
+        headers={"X-Caller-Employee-ID": "EMP-SPARSE", "X-Caller-Role": "employee"},
     )
 
     assert response.status_code == 200
@@ -271,8 +287,10 @@ def test_career_coach_openapi_contract():
     endpoint_spec = openapi_schema["paths"]["/api/career-coach"]["post"]
 
     # Verify no path or query parameters on primary body-based endpoint
-    params = endpoint_spec.get("parameters", [])
-    assert len(params) == 0
+    path_or_query_params = [
+        p for p in endpoint_spec.get("parameters", []) if p.get("in") in ("path", "query")
+    ]
+    assert len(path_or_query_params) == 0
 
     # Verify request body schema
     schema_ref = endpoint_spec["requestBody"]["content"]["application/json"]["schema"]["$ref"]
@@ -290,5 +308,4 @@ def test_career_coach_openapi_contract():
 def test_career_coach_legacy_endpoint_removed(client):
     response = client.post("/api/career-coach/EMP-API-001")
     assert response.status_code == 404
-
 

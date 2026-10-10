@@ -176,6 +176,7 @@ def test_successful_career_coach_generation(db, seed_data):
     assert result.strengths[0].evidence[0].source_type == "performance"
     assert result.development_areas[0].priority.value == "medium"
     assert len(result.development_plan) == 1
+    assert result.development_focus == "Prioritize: Cross-Functional System Documentation"
     assert result.development_plan[0].suggested_timeline == "30 days"
     mock_client.chat.completions.create.assert_called_once()
 
@@ -309,4 +310,3 @@ def test_career_coach_deadline_exceeded(db, seed_data, monkeypatch):
     with pytest.raises(CareerCoachAIServiceError) as exc_info:
         service.generate_career_plan(db, employee_id="EMP-A", period="2026-Q3")
     assert "deadline exceeded" in str(exc_info.value)
-

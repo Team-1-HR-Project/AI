@@ -41,6 +41,7 @@ from app.models import (
     Skill,
     TaskOutcome,
 )
+from app.services.shared_hr_data import is_shared_hr_schema
 
 
 def _create_legacy_pre_is_approved_schema(engine):
@@ -233,6 +234,8 @@ def test_newly_created_records_default_to_false():
 # 5. Live MySQL migration verification (runs only when MySQL is available)
 @pytest.mark.skipif(not _is_mysql_live(), reason="MySQL database not reachable")
 def test_mysql_idempotent_migration_live():
+    if is_shared_hr_schema(mysql_engine):
+        pytest.skip("Legacy approval-column migration is not applicable to the Laravel-owned HR schema")
     report = migrate_is_approved_columns(mysql_engine, default_for_legacy=False)
     assert isinstance(report, dict)
     # Since columns are present or migrated, running it now must report either columns_added or already_present

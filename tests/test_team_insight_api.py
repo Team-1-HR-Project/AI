@@ -75,7 +75,23 @@ def db_session():
 
 @pytest.fixture(scope="function")
 def client(db_session: Session):
-    """FastAPI TestClient with overridden get_db dependency."""
+    """FastAPI TestClient with overridden get_db dependency and hr_admin caller context.
+
+    Uses hr_admin role so the caller can query any department without restriction.
+    The caller employee is seeded in the "Management" department so it is never
+    counted inside the Engineering team_size.
+    """
+    # Seed the caller in "Management" — not counted in Engineering team_size
+    mgr = Employee(
+        id="EMP-MGR-ENGINEERING",
+        first_name="Manager",
+        last_name="Test",
+        role_title="Engineering Manager",
+        department="Management",
+    )
+    db_session.merge(mgr)
+    db_session.commit()
+
     def override_get_db():
         try:
             yield db_session
@@ -83,7 +99,48 @@ def client(db_session: Session):
             pass
 
     app.dependency_overrides[get_db] = override_get_db
-    with TestClient(app) as test_client:
+    with TestClient(
+        app,
+        headers={
+            "X-Caller-Employee-ID": "EMP-MGR-ENGINEERING",
+            "X-Caller-Role": "hr_admin",
+        },
+    ) as test_client:
+        yield test_client
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture(scope="function")
+def hr_admin_client(db_session: Session):
+    """FastAPI TestClient using hr_admin role for cross-department access tests.
+
+    hr_admin callers can request any department, unlike managers who are restricted
+    to their own department. Used for tests 4, 5, and 17 that send unknown/cross-dept requests.
+    """
+    admin = Employee(
+        id="EMP-HRADMIN-001",
+        first_name="Admin",
+        last_name="User",
+        role_title="HR Admin",
+        department="Human Resources",
+    )
+    db_session.merge(admin)
+    db_session.commit()
+
+    def override_get_db():
+        try:
+            yield db_session
+        finally:
+            pass
+
+    app.dependency_overrides[get_db] = override_get_db
+    with TestClient(
+        app,
+        headers={
+            "X-Caller-Employee-ID": "EMP-HRADMIN-001",
+            "X-Caller-Role": "hr_admin",
+        },
+    ) as test_client:
         yield test_client
     app.dependency_overrides.clear()
 
@@ -426,12 +483,12 @@ def test_successful_request_with_period_omitted(client: TestClient, seed_departm
     assert data["period"] == "2026-Q3"
 
 
-def test_unknown_department_insufficient_data(client: TestClient, seed_department_data):
+def test_unknown_department_insufficient_data(hr_admin_client: TestClient, seed_department_data):
     """4. Unknown department returns HTTP 200 with status='insufficient_data'."""
     mock_ai = MagicMock()
     app.dependency_overrides[get_team_insight_ai_service] = lambda: mock_ai
 
-    resp = client.post("/api/team-insight", json={"department": "NonexistentDept", "period": "2026-Q3"})
+    resp = hr_admin_client.post("/api/team-insight", json={"department": "NonexistentDept", "period": "2026-Q3"})
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "insufficient_data"
@@ -441,12 +498,12 @@ def test_unknown_department_insufficient_data(client: TestClient, seed_departmen
     mock_ai.generate_team_insight.assert_not_called()
 
 
-def test_department_with_no_approved_records_insufficient_data(client: TestClient, seed_department_data):
+def test_department_with_no_approved_records_insufficient_data(hr_admin_client: TestClient, seed_department_data):
     """5. Department with employees but no approved records returns insufficient_data."""
     mock_ai = MagicMock()
     app.dependency_overrides[get_team_insight_ai_service] = lambda: mock_ai
 
-    resp = client.post("/api/team-insight", json={"department": "Human Resources", "period": "2026-Q3"})
+    resp = hr_admin_client.post("/api/team-insight", json={"department": "Human Resources", "period": "2026-Q3"})
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "insufficient_data"
@@ -596,12 +653,12 @@ def test_ai_provider_failure_returns_502(client: TestClient, seed_department_dat
     assert "api.groq.com" not in data["detail"]
 
 
-def test_insufficient_data_path_does_not_call_ai(client: TestClient, seed_department_data):
+def test_insufficient_data_path_does_not_call_ai(hr_admin_client: TestClient, seed_department_data):
     """17. Insufficient-data path short-circuits before calling AI service."""
     mock_ai = MagicMock()
     app.dependency_overrides[get_team_insight_ai_service] = lambda: mock_ai
 
-    resp = client.post("/api/team-insight", json={"department": "UnknownTeam"})
+    resp = hr_admin_client.post("/api/team-insight", json={"department": "UnknownTeam"})
     assert resp.status_code == 200
     assert resp.json()["status"] == "insufficient_data"
     mock_ai.generate_team_insight.assert_not_called()
@@ -616,4 +673,3 @@ def test_advisory_disclaimer_enforced(client: TestClient, seed_department_data):
     data = resp.json()
     assert "advisory_disclaimer" in data
     assert "AI-assisted advisory analysis" in data["advisory_disclaimer"]
-

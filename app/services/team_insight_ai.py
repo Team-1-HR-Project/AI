@@ -11,24 +11,29 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import random
 import re
 import time
 from typing import Any
 
 from groq import (
-    APIConnectionError,
-    APIError,
-    APITimeoutError,
-    AuthenticationError,
-    BadRequestError,
     Groq,
-    RateLimitError,
 )
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 from sqlalchemy.orm import Session
 
+from app.core.groq_provider import (
+    DEFAULT_DEADLINE_SECONDS,
+    DEFAULT_TIMEOUT_SECONDS,
+    MAX_RETRIES,
+    GroqClientError,
+    GroqConfigurationError,
+    GroqDeadlineExceededError,
+    GroqEmptyResponseError,
+    GroqProviderError,
+    create_groq_client,
+    execute_chat_completion,
+    resolve_groq_config,
+)
 from app.schemas.performance_insight import TrendDirection
 from app.schemas.team_insight import (
     CompletionTrendsSummary,
@@ -43,15 +48,15 @@ from app.schemas.team_insight import (
     TeamInsightSuccessResponse,
     utc_now,
 )
+from app.services.grounding import (
+    extract_business_metrics_from_text,
+    extract_grounded_facts_from_context,
+    get_allowed_numeric_set,
+    validate_numeric_grounding,
+)
 from app.services.team_insight_context import TeamInsightContextBuilder
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
-DEFAULT_TIMEOUT_SECONDS = 30.0
-DEFAULT_DEADLINE_SECONDS = 25.0
-MAX_RETRIES = 2
-INITIAL_BACKOFF_SECONDS = 0.5
 
 # Prohibited Employment Decisions, Disciplinary Actions & Resignation/Flight Risk Predictions
 PROHIBITED_PATTERNS = [
@@ -258,81 +263,29 @@ class TeamInsightModelOutput(BaseModel):
 
 def _extract_numbers_from_text(text: str) -> list[float]:
     """Extracts numeric values from text while ignoring dates, quarters, and ID tags."""
-    if not text:
-        return []
-    # Ignore calendar and quarter formats e.g. '2026-Q3', 'Q3 2026', '2026'
-    cleaned = re.sub(r"\b\d{4}[-_/ ]?Q[1-4]\b", " ", text, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\bQ[1-4][-_/ ]?\d{4}\b", " ", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(19\d\d|20\d\d)\b", " ", cleaned)
-
-    # Ignore record tags like '#1', 'Record #2'
-    cleaned = re.sub(r"#\d+\b", " ", cleaned)
-
-    tokens = re.findall(r"[-+]?\d*\.?\d+", cleaned)
-    results: list[float] = []
-    for tok in tokens:
-        try:
-            val = float(tok)
-            results.append(round(val, 2))
-        except (ValueError, TypeError):
-            continue
-    return results
+    return extract_business_metrics_from_text(text)
 
 
 def _extract_context_numbers(context: dict[str, Any]) -> set[float]:
     """Extracts all valid numerical values present in the deterministic context."""
-    nums: set[float] = set()
+    facts = extract_grounded_facts_from_context(context)
+    nums = get_allowed_numeric_set(facts)
 
-    def add_num(v: Any) -> None:
-        if isinstance(v, (int, float)):
-            f_val = round(float(v), 2)
-            nums.add(f_val)
-            nums.add(round(abs(f_val), 2))
-            nums.add(round(f_val, 1))
-            nums.add(float(int(f_val)))
-        elif isinstance(v, str):
-            for n in _extract_numbers_from_text(v):
-                nums.add(n)
-                nums.add(round(abs(n), 2))
-
-    # Context team size
-    add_num(context.get("team_size"))
-
-    # Workload patterns
-    wp = context.get("workload_patterns", {})
-    add_num(wp.get("total_blocked_tasks"))
-    add_num(wp.get("total_delayed_goals"))
-    add_num(wp.get("affected_member_count"))
-    for g in wp.get("delayed_goal_samples", []):
-        add_num(g.get("progress"))
-
-    # Completion trends
-    ct = context.get("completion_trends", {})
-    add_num(ct.get("team_avg_task_completion"))
-    add_num(ct.get("team_avg_goal_achievement"))
-    add_num(ct.get("team_avg_overall_score"))
-    if isinstance(ct.get("comparison_averages"), dict):
-        for val in ct["comparison_averages"].values():
-            add_num(val)
-
-    # Grounding registry frequencies
-    gr = context.get("grounding_registry", {})
-    for count in gr.get("skill_frequencies", {}).values():
-        add_num(count)
-    for count in gr.get("positive_theme_frequencies", {}).values():
-        add_num(count)
-    for count in gr.get("needs_improvement_theme_frequencies", {}).values():
-        add_num(count)
+    # Centralized deterministic business thresholds
+    for t in DETERMINISTIC_THRESHOLDS:
+        nums.add(float(t))
 
     # Drill down factors
     for df in context.get("drill_down_factors", []):
         if isinstance(df, dict):
-            add_num(df.get("observation", ""))
-            add_num(df.get("supporting_metrics", ""))
-
-    # Centralized deterministic business thresholds
-    for t in DETERMINISTIC_THRESHOLDS:
-        add_num(t)
+            for k in ("observation", "supporting_metrics"):
+                val = df.get(k)
+                if isinstance(val, str):
+                    for n in extract_business_metrics_from_text(val):
+                        nums.add(n)
+                        nums.add(round(abs(n), 2))
+                elif isinstance(val, (int, float)):
+                    nums.add(float(val))
 
     return nums
 
@@ -349,19 +302,24 @@ class TeamInsightAIService:
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         max_retries: int = MAX_RETRIES,
     ):
-        self.api_key = api_key or os.getenv("GROQ_API_KEY")
+        try:
+            config = resolve_groq_config(
+                api_key=api_key,
+                model=model,
+                base_url=base_url,
+                timeout=timeout,
+                max_retries=max_retries,
+            )
+        except GroqConfigurationError as exc:
+            raise TeamInsightAIServiceError(str(exc)) from exc
 
-        if model is not None:
-            configured_model = model
-        else:
-            configured_model = os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL)
-        if not configured_model or not isinstance(configured_model, str) or not configured_model.strip():
-            raise TeamInsightAIServiceError("GROQ_MODEL configuration is missing or invalid.")
-        self.model = configured_model.strip()
-
-        self.base_url = base_url or os.getenv("GROQ_BASE_URL", "https://api.groq.com")
-        self.timeout = float(os.getenv("GROQ_TIMEOUT_SECONDS", str(timeout)))
-        self.max_retries = max_retries
+        self.config = config
+        self.api_key = config.api_key
+        self.model = config.model
+        self.base_url = config.base_url
+        self.timeout = config.timeout
+        self.deadline = config.deadline
+        self.max_retries = config.max_retries
         self._client = client
 
     def _get_client(self) -> Groq:
@@ -371,7 +329,15 @@ class TeamInsightAIService:
             raise TeamInsightAIServiceError(
                 "GROQ_API_KEY is not configured. Please set the GROQ_API_KEY environment variable."
             )
-        return Groq(api_key=self.api_key, base_url=self.base_url, timeout=self.timeout)
+        try:
+            return create_groq_client(
+                config=self.config,
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=self.timeout,
+            )
+        except GroqConfigurationError as exc:
+            raise TeamInsightAIServiceError(str(exc)) from exc
 
     def _call_llm_with_retry(
         self,
@@ -380,67 +346,34 @@ class TeamInsightAIService:
     ) -> str:
         """Invokes Groq with exponential backoff retries and deadline enforcement."""
         client = self._get_client()
-        attempts = self.max_retries + 1
-        last_exception: Exception | None = None
-
-        for attempt in range(attempts):
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TeamInsightAIServiceError(
-                    "AI request deadline exceeded before provider invocation. Service temporarily unavailable."
-                )
-
-            try:
-                response = client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": GROQ_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=0.1,
-                    max_tokens=3000,
-                    response_format={"type": "json_object"},
-                )
-
-                content = response.choices[0].message.content
-                if not content or not content.strip():
-                    raise TeamInsightAIServiceError("Empty response returned from AI provider.")
-                return content.strip()
-
-            except (APIConnectionError, APITimeoutError) as exc:
-                last_exception = exc
-                logger.warning(
-                    "Groq transient connection error (attempt %d/%d): %s",
-                    attempt + 1,
-                    attempts,
-                    exc,
-                )
-            except RateLimitError as exc:
-                last_exception = exc
-                logger.warning(
-                    "Groq rate limit encountered (attempt %d/%d): %s",
-                    attempt + 1,
-                    attempts,
-                    exc,
-                )
-            except (AuthenticationError, BadRequestError) as exc:
-                logger.error("Groq non-retryable client error: %s", exc)
-                raise TeamInsightAIServiceError(
-                    "AI provider configuration or request formatting error."
-                ) from exc
-            except APIError as exc:
-                last_exception = exc
-                logger.warning("Groq API error (attempt %d/%d): %s", attempt + 1, attempts, exc)
-            except Exception as exc:
-                logger.error("Unexpected error during AI provider call: %s", exc)
-                raise TeamInsightAIServiceError("Unexpected AI provider communication failure.") from exc
-
-            if attempt < attempts - 1:
-                backoff = INITIAL_BACKOFF_SECONDS * (2**attempt) + random.uniform(0.05, 0.2)
-                time.sleep(backoff)
-
-        raise TeamInsightAIServiceError(
-            f"AI provider failed after {attempts} attempts. Last error: {last_exception}"
-        )
+        try:
+            return execute_chat_completion(
+                client=client,
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": GROQ_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.1,
+                max_tokens=3000,
+                response_format={"type": "json_object"},
+                timeout=self.timeout,
+                deadline=deadline,
+                max_retries=self.max_retries,
+                error_label="AI provider",
+            )
+        except GroqDeadlineExceededError as exc:
+            raise TeamInsightAIServiceError(
+                "AI request deadline exceeded. Service temporarily unavailable."
+            ) from exc
+        except GroqClientError as exc:
+            raise TeamInsightAIServiceError(
+                "AI provider configuration or request formatting error."
+            ) from exc
+        except GroqEmptyResponseError as exc:
+            raise TeamInsightAIServiceError("Empty response returned from AI provider.") from exc
+        except GroqProviderError as exc:
+            raise TeamInsightAIServiceError(str(exc)) from exc
 
     def _check_prohibited_terms(self, text: str) -> None:
         """Enforces absolute prohibition of employment decisions, PIPs, and resignation predictions."""
@@ -510,9 +443,19 @@ class TeamInsightAIService:
             self._check_privacy_and_pii(txt)
 
         # 2. Check contradictory trend direction
-        dir_val = context["completion_trends"]["direction"]
+        completion_trends = context.get("completion_trends") or {}
+        dir_val = completion_trends.get("direction")
+        if not dir_val:
+            raise TeamInsightAIServiceError(
+                "Team insight context is missing the required completion trend direction."
+            )
         if isinstance(dir_val, str):
-            dir_val = TrendDirection(dir_val)
+            try:
+                dir_val = TrendDirection(dir_val)
+            except ValueError as exc:
+                raise TeamInsightAIServiceError(
+                    "Team insight context contains an invalid completion trend direction."
+                ) from exc
         self._check_contradictory_trend(output.completion_trends_summary, dir_val)
         self._check_contradictory_trend(output.executive_summary, dir_val)
 
@@ -555,16 +498,17 @@ class TeamInsightAIService:
 
         for txt in text_fields:
             extracted_nums = _extract_numbers_from_text(txt)
-            for num in extracted_nums:
-                if not any(abs(num - c_num) < 1e-4 for c_num in context_numbers):
-                    logger.warning(
-                        "Team insight output rejected: ungrounded number %s in narrative text: '%s'",
-                        num,
-                        txt,
-                    )
-                    raise TeamInsightAIServiceError(
-                        f"Grounding validation failure: numeric value '{num}' in narrative is not supported by context."
-                    )
+            is_valid, ungrounded = validate_numeric_grounding(extracted_nums, context_numbers, tolerance=1e-4)
+            if not is_valid:
+                num = ungrounded[0]
+                logger.warning(
+                    "Team insight output rejected: ungrounded number %s in narrative text: '%s'",
+                    num,
+                    txt,
+                )
+                raise TeamInsightAIServiceError(
+                    f"Grounding validation failure: numeric value '{num}' in narrative is not supported by context."
+                )
 
         # 6. Skill gaps grounding
         approved_skills = {
@@ -692,7 +636,7 @@ class TeamInsightAIService:
             if not isinstance(parsed_json, dict):
                 raise TypeError("Expected JSON object from AI provider.")
             model_output = TeamInsightModelOutput.model_validate(parsed_json)
-        except (json.JSONDecodeError, Exception) as exc:
+        except (json.JSONDecodeError, TypeError, ValueError, ValidationError) as exc:
             logger.error("AI provider returned invalid JSON or schema structure: %s", exc)
             raise TeamInsightAIServiceError(
                 "AI provider output could not be parsed into a valid team insight summary."
@@ -723,7 +667,9 @@ class TeamInsightAIService:
 
         skill_gap_patterns = SkillGapPatternsSummary(
             summary=model_output.skill_gap_summary,
-            top_common_gaps=model_output.top_common_gaps or context["skill_patterns"].get("top_common_skills", []),
+            # An inventory of common skills is not evidence of a skill gap.
+            # Keep the model's explicitly grounded gaps empty when it returns none.
+            top_common_gaps=model_output.top_common_gaps,
         )
 
         evaluation_theme_patterns = EvaluationThemePatternsSummary(

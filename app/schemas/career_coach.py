@@ -186,6 +186,12 @@ class FollowUp(BaseModel):
 # 5. Schema for LLM Model Generation (Strictly omits employee_id and created_at)
 class CareerCoachModelOutput(BaseModel):
     status: Literal["success"] = Field("success", description="Status indicator")
+    development_focus: str | None = Field(
+        default=None,
+        min_length=3,
+        max_length=500,
+        description="Overall development focus for the next review period",
+    )
     strengths: list[StrengthItem] = Field(
         ...,
         min_length=1,
@@ -221,6 +227,12 @@ class CareerCoachSuccessResponse(BaseModel):
         min_length=1,
         max_length=100,
         description="Target employee identifier (authoritatively assigned by service)",
+    )
+    development_focus: str | None = Field(
+        default=None,
+        min_length=3,
+        max_length=500,
+        description="Overall development focus for the next review period",
     )
     strengths: list[StrengthItem] = Field(
         ...,

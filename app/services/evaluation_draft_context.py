@@ -21,6 +21,11 @@ from app.models import (
     Skill,
     TaskOutcome,
 )
+from app.services.shared_hr_data import (
+    build_shared_career_context,
+    get_shared_employee,
+    is_shared_hr_schema,
+)
 
 # Context Budget Limits
 MAX_PERFORMANCE_RECORDS = 5
@@ -161,6 +166,44 @@ class EvaluationDraftContextBuilder:
         - Prioritizes target period records, then newer records deterministically.
         - Provides approved_sources index for grounding verification.
         """
+        if is_shared_hr_schema(db.get_bind()):
+            employee = get_shared_employee(db, employee_id)
+            if not employee:
+                return {
+                    "has_sufficient_data": False,
+                    "missing_categories": EVALUATION_CATEGORIES.copy(),
+                    "error": f"Employee with id '{employee_id}' not found.",
+                    "context": None,
+                    "approved_sources": {},
+                    "selected_source_ids": {},
+                }
+            result = build_shared_career_context(
+                db, employee, period,
+                {"performance": MAX_PERFORMANCE_RECORDS, "goals": MAX_GOALS, "task_outcomes": MAX_TASK_OUTCOMES, "evaluation_themes": MAX_EVALUATION_THEMES},
+            )
+            inner_ctx = result.get("context") or {}
+            flattened = {
+                "employee": inner_ctx.get("employee"),
+                "period": period,
+                "has_sufficient_data": result.get("has_sufficient_data", False),
+                "missing_categories": result.get("missing_categories", []),
+                "performance": inner_ctx.get("performance", []),
+                "goals": inner_ctx.get("goals", []),
+                "skills": inner_ctx.get("skills", []),
+                "task_outcomes": inner_ctx.get("task_outcomes", []),
+                "evaluation_themes": inner_ctx.get("evaluation_themes", []),
+                "approved_sources": result.get("approved_sources", {}),
+                "selected_source_ids": result.get("selected_source_ids", {}),
+            }
+            limited_context, approved_sources, selected_source_ids = (
+                EvaluationDraftContextBuilder.enforce_total_context_limit(
+                    flattened, period=period, max_chars=MAX_TOTAL_CONTEXT_CHARS
+                )
+            )
+            limited_context["approved_sources"] = approved_sources
+            limited_context["selected_source_ids"] = selected_source_ids
+            return limited_context
+
         employee = db.query(Employee).filter(Employee.id == employee_id).first()
         if not employee:
             return {
